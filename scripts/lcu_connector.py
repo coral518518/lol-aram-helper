@@ -78,18 +78,20 @@ class LCUConnector:
 
     def connect(self):
         """尝试连接到 League 客户端。返回 bool"""
-        if self._connect_via_process() or self._connect_via_lockfile():
+        # 优化: 优先尝试极速且 0 CPU 开销的 lockfile，未命中再尝试扫描进程
+        if self._connect_via_lockfile() or self._connect_via_process():
             return self._finalize_connection()
         self._connected = False
         return False
 
     def _connect_via_process(self):
-        """通过扫描进程命令行参数获取连接信息"""
+        """通过扫描进程命令行参数获取连接信息 (优化: 仅匹配进程名后再读取 cmdline，避免大量无谓系统调用)"""
         try:
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            for proc in psutil.process_iter(['name']):
                 try:
-                    if proc.info['name'] and proc.info['name'].lower() == 'leagueclientux.exe':
-                        cmdline = proc.info.get('cmdline', [])
+                    p_name = proc.info.get('name')
+                    if p_name and p_name.lower() == 'leagueclientux.exe':
+                        cmdline = proc.cmdline()
                         if not cmdline:
                             continue
                         port = token = None

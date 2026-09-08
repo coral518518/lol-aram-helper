@@ -2,17 +2,39 @@
 ARAM 海克斯助手 - GUI 启动器
 独立 EXE 入口点，提供图形化界面与系统托盘支持
 """
+# 限制底层数学库并发线程数，避免 ONNX / OpenBLAS 吃满多核影响游戏帧率
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import threading
 import queue
-import os
 import sys
 import io
 import time
 import datetime
 import math
 import traceback
+
+
+def set_low_priority():
+    """将当前进程优先级设为低于普通 (BELOW_NORMAL)，确保 LOL 游戏渲染独占 CPU 核心"""
+    try:
+        import psutil
+        p = psutil.Process()
+        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    except Exception:
+        try:
+            import ctypes
+            # 0x00004000 为 BELOW_NORMAL_PRIORITY_CLASS
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        except Exception:
+            pass
 
 # ============ 路径初始化 (兼容 PyInstaller 打包) ============
 
@@ -241,7 +263,7 @@ class GUIController(threading.Thread):
                 time.sleep(0.5)
                 return  # 退出 listening_phase, 回到 auto_detect
 
-            time.sleep(0.05)
+            time.sleep(0.1)  # 优化: 0.05 -> 0.1, 降低热键轮询 CPU 唤醒频率
 
 
 # ================= 系统托盘管理 =================
@@ -593,11 +615,30 @@ class LauncherApp:
         # 构建 UI
         self._build_ui()
 
-        # 启动队列轮询
-        self.root.after(100, self._poll_queues)
+        # 启动队列轮询 (优化: 150ms 轮询降低空闲 CPU 占用)
+        self.root.after(150, self._poll_queues)
 
         # 启动时加载数据
         self.root.after(300, self._load_data)
+
+        # F5 全局热键防抖与注册
+        self._last_f5_time = 0
+        self._setup_global_hotkeys()
+
+    def _setup_global_hotkeys(self):
+        """注册 F5 全局热键，支持游戏内外随时开启/停止识别引擎"""
+        try:
+            keyboard.add_hotkey('f5', self._on_f5_press, suppress=False)
+        except Exception as e:
+            self._log_safe(f"⚠ F5 热键注册失败: {e}")
+
+    def _on_f5_press(self):
+        """F5 按键触发引擎切换 (防抖 0.8s)"""
+        now = time.time()
+        if now - self._last_f5_time < 0.8:
+            return
+        self._last_f5_time = now
+        self.gui_queue.put({"event": "toggle_engine"})
 
     # ==========================================
     # ttk 样式配置
@@ -725,11 +766,11 @@ class LauncherApp:
         # ---- 热键提示 ----
         hotkey_frame = tk.Frame(main, bg=self.BG)
         hotkey_frame.pack(fill=tk.X, pady=(0, 12))
-        hotkeys = [("F6", "分析海克斯"), ("F7", "识别英雄"), ("F8", "重置")]
+        hotkeys = [("F5", "开关引擎"), ("F6", "分析海克斯"), ("F7", "识别英雄"), ("F8", "重置")]
         for key, desc in hotkeys:
             pill = tk.Frame(hotkey_frame, bg=self.BORDER, padx=1, pady=1)
-            pill.pack(side=tk.LEFT, padx=(0, 10))
-            inner = tk.Frame(pill, bg=self.BG_CARD, padx=8, pady=3)
+            pill.pack(side=tk.LEFT, padx=(0, 8))
+            inner = tk.Frame(pill, bg=self.BG_CARD, padx=6, pady=3)
             inner.pack()
             tk.Label(inner, text=key, font=("Consolas", 9, "bold"),
                      fg=self.ACCENT, bg=self.BG_CARD).pack(side=tk.LEFT, padx=(0, 4))
@@ -740,12 +781,12 @@ class LauncherApp:
         btn_frame = tk.Frame(main, bg=self.BG)
         btn_frame.pack(fill=tk.X, pady=(0, 12))
 
-        # 开始/停止按钮
-        self.start_btn = ttk.Button(btn_frame, text="▶  开始识别",
+        # 开始/停止按钮 (提示快捷键 F5)
+        self.start_btn = ttk.Button(btn_frame, text="▶  开始识别 (F5)",
                                      style='Accent.TButton', command=self._start_engine)
         self.start_btn.pack(fill=tk.X, pady=(0, 8))
 
-        self.stop_btn = ttk.Button(btn_frame, text="■  停止运行",
+        self.stop_btn = ttk.Button(btn_frame, text="■  停止运行 (F5)",
                                     style='Danger.TButton', command=self._stop_engine)
         # 停止按钮初始隐藏
 
@@ -863,7 +904,7 @@ class LauncherApp:
 
             self.engine_running = True
             self._set_status("运行中", self.SUCCESS)
-            self._log("✅ 引擎已启动! F6=分析 | F7=识别 | F8=重置")
+            self._log("✅ 引擎已启动! F5=开关 | F6=分析 | F7=识别 | F8=重置")
             self._start_pulse()
 
             # 启动托盘
@@ -955,23 +996,12 @@ class LauncherApp:
 
     def _minimize_to_tray(self):
         """最小化到系统托盘"""
-        if not self.engine_running:
-            messagebox.showinfo("提示", "请先点击「开始识别」再最小化到托盘")
-            return
         self.root.withdraw()
-        self.tray.notify("ARAM 海克斯助手", "程序已最小化到系统托盘，热键仍然有效")
-        # 确保 overlay 仍然可见
-        if self.overlay_window:
-            self.root.after(100, self._ensure_overlay_visible)
+        self.tray.notify("ARAM 海克斯助手", "程序已最小化到系统托盘，热键 (F5/F6/F7/F8) 仍然有效")
 
     def _ensure_overlay_visible(self):
-        """确保 overlay 在 root 隐藏后仍然可见"""
-        if self.overlay_window:
-            try:
-                self.overlay_window.deiconify()
-                self.overlay_window.attributes("-topmost", True)
-            except Exception:
-                pass
+        """Overlay 由 OverlayApp 自主管理按需显示，无需强制 deiconify"""
+        pass
 
     def _restore_from_tray(self):
         """从托盘恢复窗口"""
@@ -1001,12 +1031,25 @@ class LauncherApp:
         except queue.Empty:
             pass
 
-        self.root.after(80, self._poll_queues)
+        self.root.after(150, self._poll_queues)
 
     def _handle_gui_message(self, msg):
         event = msg.get("event", "")
 
-        if event == "data_loaded":
+        if event == "toggle_engine":
+            if self.engine_running:
+                self._stop_engine()
+                self._log("⏹ [F5] 识别引擎已停止")
+                self.tray.notify("ARAM 海克斯助手", "⏹ 识别引擎已停止 (F5)")
+            else:
+                if self.dm and self.dm.hero_data:
+                    self._start_engine()
+                    self._log("▶ [F5] 识别引擎已启动")
+                    self.tray.notify("ARAM 海克斯助手", "▶ 识别引擎已启动 (F5)")
+                else:
+                    self._log("⚠ 数据尚未加载完成，暂无法启动引擎")
+
+        elif event == "data_loaded":
             self.start_btn.config(state=tk.NORMAL)
 
         elif event == "data_error":
@@ -1119,10 +1162,17 @@ class LauncherApp:
         self.status_color = color
 
     def _start_pulse(self):
-        """启动状态指示灯脉冲动画"""
+        """启动状态指示灯脉冲动画 (优化: 最小化时挂起，显示时降频至 300ms)"""
         def _pulse():
             if not self.engine_running:
                 return
+            # 如果窗口最小化到托盘/不可见，挂起动画更新，降低空跑 CPU 消耗
+            try:
+                if not self.root.winfo_viewable():
+                    self.root.after(500, _pulse)
+                    return
+            except Exception:
+                pass
             self._pulse_state = (self._pulse_state + 1) % 20
             # 呼吸灯效果
             brightness = abs(self._pulse_state - 10) / 10.0
@@ -1131,7 +1181,7 @@ class LauncherApp:
                 g = int(185 + brightness * 50)
                 b = int(80 + brightness * 30)
                 self.status_dot.config(fg=f"#{r:02x}{g:02x}{b:02x}")
-            self.root.after(100, _pulse)
+            self.root.after(300, _pulse)
         _pulse()
 
     def _log(self, msg):
@@ -1180,6 +1230,10 @@ class LauncherApp:
 
     def _quit_app(self):
         """完全退出程序"""
+        try:
+            keyboard.remove_hotkey('f5')
+        except Exception:
+            pass
         self._engine_cleanup()
         sys.stdout = self._orig_stdout
         sys.stderr = self._orig_stderr
@@ -1238,6 +1292,9 @@ def main():
                     sys.exit(0)
                 except Exception:
                     pass  # 用户取消 UAC, 继续普通运行
+
+        # 降低当前进程优先级为低于正常，确保 LOL 游戏渲染独占 CPU
+        set_low_priority()
 
         app = LauncherApp()
         app.run()

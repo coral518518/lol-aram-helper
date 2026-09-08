@@ -1,7 +1,14 @@
+# 限制底层数学库并发线程数，避免 ONNX / OpenBLAS 吃满多核影响游戏帧率
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import time
 import json
 import csv
-import os
 import sys
 import threading
 import queue
@@ -18,6 +25,26 @@ from thefuzz import process, fuzz
 from scripts.config import BASE_DIR, DATA_DIR
 from scripts.lcu_connector import LCUConnector
 from rapidocr_onnxruntime import RapidOCR
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+
+def set_low_priority():
+    """将当前进程优先级设为低于普通 (BELOW_NORMAL)，确保 LOL 游戏渲染独占 CPU 核心"""
+    try:
+        import psutil
+        p = psutil.Process()
+        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+    except Exception:
+        try:
+            # 0x00004000 为 BELOW_NORMAL_PRIORITY_CLASS
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x00004000)
+        except Exception:
+            pass
 
 # ================= 配置与常量 =================
 
@@ -189,23 +216,33 @@ class GameAnalyzer:
 
     def __init__(self, data_manager):
         self.dm = data_manager
-        # OCR 引擎: 降低 det_limit_side_len (默认736→480)
-        # 截取区域 2x 上采样后最大 640px, 480 足以覆盖, 减少检测模型不必要计算
-        try:
-            self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=480)
-        except (KeyError, TypeError, Exception) as e:
-            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            print(f"\n❌ OCR 引擎初始化失败: {e}")
-            print(f"   当前 Python 版本: {py_ver}")
-            if sys.version_info >= (3, 13):
-                print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
-            else:
-                print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
-            raise
-        # 根据 CPU 逻辑核心数决定并发策略
         self._cpu_count = os.cpu_count() or 4
+        # 优化: 针对低配 CPU 限制 OCR 推理线程数 (最多 2 线程，双核使用 1 线程)，留足 CPU 核心给游戏
+        ocr_threads = min(2, max(1, self._cpu_count // 2))
+        try:
+            self.ocr = RapidOCR(
+                use_angle_cls=False,
+                det_limit_side_len=400,
+                intra_op_num_threads=ocr_threads,
+                inter_op_num_threads=1
+            )
+        except (KeyError, TypeError, Exception):
+            try:
+                self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=400)
+            except (KeyError, TypeError, Exception) as e:
+                py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                print(f"\n❌ OCR 引擎初始化失败: {e}")
+                print(f"   当前 Python 版本: {py_ver}")
+                if sys.version_info >= (3, 13):
+                    print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
+                else:
+                    print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
+                raise
+
+        # 仅在超多核心 (>=12 线程) 时开启并发，普通/低配 CPU 采用串行避免核争抢
         self._use_parallel = self._cpu_count >= 12
         self.executor = ThreadPoolExecutor(max_workers=3)
+        self._match_cache = {}  # 模糊匹配结果缓存 (hero_cn, text) -> match_name
         # 预热 OCR 引擎 (消除首次推理的模型加载和内存分配延迟)
         self._warmup()
 
@@ -219,7 +256,7 @@ class GameAnalyzer:
             pass
 
     def capture_all_regions(self):
-        """批量截图: 复用单个 mss 上下文, 避免重复初始化开销"""
+        """批量截图: 复用单个 mss 上下文, 优先使用硬件级 cv2 处理以降低 CPU 开销"""
         images = {}
         try:
             with mss.mss() as sct:
@@ -232,12 +269,18 @@ class GameAnalyzer:
                         "mon": 0
                     }
                     raw = sct.grab(monitor)
-                    img = Image.frombytes("RGB", raw.size, raw.rgb)
-                    gray = img.convert("L")
-                    w, h = gray.size
-                    # 2倍上采样提高文字清晰度
-                    resized = gray.resize((w * 2, h * 2), Image.BICUBIC)
-                    images[key] = np.array(resized)
+                    if HAS_CV2:
+                        # 零拷贝/低开销转换: 直接从 mss 缓冲区转为 numpy 矩阵 (BGRA)
+                        arr = np.frombuffer(raw.raw, dtype=np.uint8).reshape((raw.height, raw.width, 4))
+                        gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
+                        # SIMD 硬件加速双线性插值放大 2 倍
+                        images[key] = cv2.resize(gray, (raw.width * 2, raw.height * 2), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        img = Image.frombytes("RGB", raw.size, raw.rgb)
+                        gray = img.convert("L")
+                        w, h = gray.size
+                        resized = gray.resize((w * 2, h * 2), Image.BICUBIC)
+                        images[key] = np.array(resized)
         except Exception as e:
             print(f"批量截图失败: {e}")
         return images
@@ -269,15 +312,21 @@ class GameAnalyzer:
                 return res
 
             match_name = None
-            
-            # 1. 精确匹配 (O(1))
-            if txt in hero_augments:
+            cache_key = (hero_cn, txt)
+
+            # 1. 命中内存缓存 (O(1))
+            if cache_key in self._match_cache:
+                match_name = self._match_cache[cache_key]
+            # 2. 精确匹配 (O(1))
+            elif txt in hero_augments:
                 match_name = txt
+                self._match_cache[cache_key] = match_name
             else:
-                # 2. 模糊匹配 (使用精确比例 fuzz.ratio，避免子串过分匹配)
+                # 3. 模糊匹配 (使用精确比例 fuzz.ratio，避免子串过分匹配)
                 match, score = process.extractOne(txt, list(hero_augments.keys()), scorer=fuzz.ratio)
                 if score > 60:
                     match_name = match
+                self._match_cache[cache_key] = match_name
 
             if match_name:
                 info = hero_augments[match_name]
@@ -355,14 +404,15 @@ class OverlayApp:
         self.labels = {}
         self.hide_timer = None
         
-        # 先隐藏窗口，避免配置透明前闪白框
+        # 优化: 保持隐藏状态 (withdraw)。仅在有提示内容时才显示 (deiconify)
+        # 避免全屏透明置顶窗口常驻导致 Windows DWM 强制全屏合成, 破坏游戏的 DirectFlip 导致持续掉帧
         self.root.withdraw()
         self._setup_window()
         self._setup_labels()
-        self.root.deiconify()
+        # 初始保持隐藏，不调用 deiconify()
         
-        # 启动队列消息监听
-        self.root.after(100, self.process_queue)
+        # 启动队列消息监听 (优化: 120ms 轮询, 减少后台空闲 CPU 唤醒)
+        self.root.after(120, self.process_queue)
 
     def _setup_window(self):
         self.root.title("ARAM Overlay")
@@ -409,7 +459,7 @@ class OverlayApp:
         except queue.Empty:
             pass
         finally:
-            self.root.after(50, self.process_queue)
+            self.root.after(120, self.process_queue)
 
     def clear_display(self):
         if self.hide_timer:
@@ -417,9 +467,19 @@ class OverlayApp:
             self.hide_timer = None
         for lbl in self.labels.values():
             lbl.place_forget()
+        # 优化: 彻底隐藏窗口，撤出 DWM 渲染树，恢复游戏满血帧率与 DirectFlip 独占加速
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
 
     def show_status(self, text):
         self.clear_display()
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception:
+            pass
         lbl = self.labels['hex_2']
         lbl.config(text=text, fg=COLORS["status"])
         lbl.place(relx=0.5, rely=0.5, anchor="center")
@@ -428,6 +488,15 @@ class OverlayApp:
 
     def update_display(self, results):
         self.clear_display()
+        has_content = any(info.get("text") for info in results.values())
+        if not has_content:
+            return
+
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception:
+            pass
         
         # 强制对齐 Y 轴
         base_y_abs = REGIONS['hex_1']['top']
@@ -464,6 +533,8 @@ class InputController(threading.Thread):
         self.analyzer = analyzer
         self.lcu = lcu_connector
         self.current_hero = None
+        self.paused = False
+        self._last_f5 = 0
         self._last_f6 = 0
         self._last_f7 = 0
         self._last_f8 = 0
@@ -506,7 +577,7 @@ class InputController(threading.Thread):
         self.flush_input()
 
         print("=== ARAM Hextech Helper ===")
-        print("    F6=分析 | F7=刷新英雄 | F8=手动输入\n")
+        print("    F5=总开关 | F6=分析 | F7=刷新英雄 | F8=手动输入\n")
 
         # ====== 尝试自动检测 (轮询最多30秒) ======
         if self.lcu:
@@ -517,7 +588,7 @@ class InputController(threading.Thread):
                 if hero:
                     self.current_hero = hero
                     print(f"\n>>> 自动识别到英雄: [{hero}] (数据源: {source})")
-                    print(f">>> F6=分析 | F7=刷新 | F8=手动")
+                    print(f">>> F5=总开关 | F6=分析 | F7=刷新 | F8=手动")
                     self.queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析 | F7 刷新"})
                     self.hide_console_window()
                     return
@@ -593,7 +664,7 @@ class InputController(threading.Thread):
                     continue
                 self.current_hero = validated
                 print(f">>> 已锁定: {validated}")
-                print(f">>> F6=分析 | F7=刷新 | F8=手动")
+                print(f">>> F5=总开关 | F6=分析 | F7=刷新 | F8=手动")
                 self.queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析 | F7 刷新"})
                 self.hide_console_window()
                 break
@@ -604,10 +675,25 @@ class InputController(threading.Thread):
 
     def listening_phase(self):
         self.flush_input()
-        print(f"[监听中...] 当前英雄: {self.current_hero} | F6分析 / F7刷新 / F8手动")
+        print(f"[监听中...] 当前英雄: {self.current_hero} | F5开关 / F6分析 / F7刷新 / F8手动")
 
         while True:
             now = time.time()
+
+            # F5 - 暂停/恢复总开关
+            if keyboard.is_pressed('f5') and now - self._last_f5 > 1.0:
+                self._last_f5 = now
+                self.paused = not self.paused
+                if self.paused:
+                    print(">>> [F5] 助手已暂停 (0% 算力占用)")
+                    self.queue.put({"cmd": "STATUS", "data": "⏸ 助手已暂停 (F5)"})
+                else:
+                    print(">>> [F5] 助手已恢复")
+                    self.queue.put({"cmd": "STATUS", "data": f"▶ 助手已恢复 (F5)\n当前: {self.current_hero or '未知'}"})
+
+            if self.paused:
+                time.sleep(0.2)
+                continue
 
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
                 self._last_f6 = now
@@ -639,7 +725,7 @@ class InputController(threading.Thread):
                 time.sleep(0.5)
                 return  # 退出监听，回到 select_hero_phase
 
-            time.sleep(0.05)
+            time.sleep(0.1)  # 优化: 0.05 -> 0.1, 降低 CPU 唤醒频率
 
 
     @staticmethod
@@ -671,6 +757,9 @@ def main():
     os.system('title ARAM 海克斯助手')
     os.system('chcp 65001 >nul')
     print(f"Working Directory: {BASE_DIR}")
+
+    # 降低进程优先级，确保 LOL 游戏独占 CPU
+    set_low_priority()
 
     # 1. 初始化核心数据与逻辑
     dm = DataManager()
