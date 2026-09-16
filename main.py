@@ -254,15 +254,21 @@ class GameAnalyzer:
         except (KeyError, TypeError, Exception):
             try:
                 self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=360)
-            except (KeyError, TypeError, Exception) as e:
-                py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-                print(f"\n❌ OCR 引擎初始化失败: {e}")
-                print(f"   当前 Python 版本: {py_ver}")
-                if sys.version_info >= (3, 13):
-                    print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
-                else:
-                    print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
-                raise
+            except (KeyError, TypeError, Exception):
+                try:
+                    self.ocr = RapidOCR(use_angle_cls=False)
+                except (KeyError, TypeError, Exception):
+                    try:
+                        self.ocr = RapidOCR()
+                    except (KeyError, TypeError, Exception) as e:
+                        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                        print(f"\n❌ OCR 引擎初始化失败: {e}")
+                        print(f"   当前 Python 版本: {py_ver}")
+                        if sys.version_info >= (3, 13):
+                            print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
+                        else:
+                            print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
+                        raise
 
         # 仅在超多核心 (>=12 线程) 时开启并发，普通/低配 CPU 采用串行避免核争抢
         self._use_parallel = self._cpu_count >= 12
