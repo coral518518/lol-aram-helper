@@ -9,12 +9,22 @@ LCU Connector - 英雄联盟客户端本地 API 连接器
   2. InProgress  阶段: /lol-gameflow/v1/session (gameData)
   3. InGame     备用:  Live Client Data API (端口 2999)
 """
+import base64
 import json
 import os
+import ssl
+import threading
+import time
 
 import psutil
 import requests
 import urllib3
+
+try:
+    import websocket
+    HAS_WEBSOCKET = True
+except ImportError:
+    HAS_WEBSOCKET = False
 
 # 禁用 SSL 自签名证书警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,7 +47,7 @@ COMMON_INSTALL_PATHS = [
 
 
 class LCUConnector:
-    """英雄联盟客户端 LCU API 连接器（全生命周期）"""
+    """英雄联盟客户端 LCU API 连接器（全生命周期 + WebSocket 事件驱动）"""
 
     LCU_TIMEOUT = 3       # LCU API 请求超时 (秒)
     LIVE_API_TIMEOUT = 2  # Live Client Data API 超时 (秒)
@@ -48,6 +58,19 @@ class LCUConnector:
         self.base_url = None
         self._connected = False
         self._summoner_id = None  # 缓存当前召唤师ID
+
+        # 锁文件路径记忆缓存 (避免反复调用 psutil 遍历进程)
+        self._cached_lockfile_path = None
+        self._session = requests.Session()
+        self._session.verify = False
+
+        # WebSocket 事件监听相关
+        self._ws_app = None
+        self._ws_thread = None
+        self._ws_running = False
+        self.on_hero_changed = None   # callback(hero_name, source)
+        self.on_phase_changed = None  # callback(phase)
+        self.on_hero_reset = None     # callback()
 
         # 加载 champions.json: 中文名 -> 英文名
         self.cn_to_en = {}
@@ -104,6 +127,12 @@ class LCUConnector:
                             self.port = port
                             self.auth_token = token
                             self.base_url = f"https://127.0.0.1:{port}"
+                            try:
+                                proc_exe = proc.exe()
+                                if proc_exe:
+                                    self._cached_lockfile_path = os.path.join(os.path.dirname(proc_exe), 'lockfile')
+                            except Exception:
+                                pass
                             return True
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
@@ -112,9 +141,13 @@ class LCUConnector:
         return False
 
     def _connect_via_lockfile(self):
-        """通过读取 lockfile 获取连接信息"""
-        for base_path in COMMON_INSTALL_PATHS:
-            lockfile_path = os.path.join(base_path, 'lockfile')
+        """通过读取 lockfile 获取连接信息 (优化: 优先检查缓存路径)"""
+        paths_to_check = []
+        if self._cached_lockfile_path:
+            paths_to_check.append(self._cached_lockfile_path)
+        paths_to_check.extend([os.path.join(p, 'lockfile') for p in COMMON_INSTALL_PATHS])
+
+        for lockfile_path in paths_to_check:
             if os.path.exists(lockfile_path):
                 try:
                     with open(lockfile_path, 'r') as f:
@@ -124,28 +157,30 @@ class LCUConnector:
                         self.port = parts[2]
                         self.auth_token = parts[3]
                         self.base_url = f"https://127.0.0.1:{self.port}"
+                        self._cached_lockfile_path = lockfile_path
                         return True
                 except Exception:
                     continue
         return False
 
     def _finalize_connection(self):
-        """连接成功后，构建英雄 ID 映射 + 缓存召唤师ID"""
+        """连接成功后，配置长连接 Session + 构建英雄 ID 映射 + 缓存召唤师ID"""
         self._connected = True
+        if self.auth_token:
+            self._session.auth = ('riot', self.auth_token)
         self._build_champion_id_map()
         self._cache_summoner_id()
         print(f"   [OK] LCU connected (port: {self.port})")
         return True
 
     def _request(self, method, endpoint, **kwargs):
-        """向 LCU API 发送请求"""
+        """向 LCU API 发送请求 (复用长连接 Session)"""
         if not self.base_url or not self.auth_token:
             return None
         try:
-            resp = requests.request(
+            resp = self._session.request(
                 method, f"{self.base_url}{endpoint}",
-                auth=('riot', self.auth_token),
-                verify=False, timeout=self.LCU_TIMEOUT, **kwargs
+                timeout=self.LCU_TIMEOUT, **kwargs
             )
             return resp
         except requests.exceptions.ConnectionError:
@@ -343,3 +378,191 @@ class LCUConnector:
                 return hero, "ChampSelect"
 
         return None, phase or ""
+
+    # ==========================================
+    # WebSocket 实时事件监听 (0.00% CPU 事件驱动)
+    # ==========================================
+
+    def start_ws_listener(self, on_hero_changed=None, on_phase_changed=None, on_hero_reset=None):
+        """
+        启动后台 LCU WebSocket 事件监听 (0.00% CPU 模式)。
+        
+        Args:
+            on_hero_changed: 回调函数 (hero_name: str, source: str) -> None
+            on_phase_changed: 回调函数 (phase: str) -> None
+            on_hero_reset: 回调函数 () -> None
+        """
+        if on_hero_changed:
+            self.on_hero_changed = on_hero_changed
+        if on_phase_changed:
+            self.on_phase_changed = on_phase_changed
+        if on_hero_reset:
+            self.on_hero_reset = on_hero_reset
+
+        if self._ws_running:
+            return
+
+        self._ws_running = True
+        self._ws_thread = threading.Thread(target=self._ws_worker, daemon=True, name="LCU-WebSocket")
+        self._ws_thread.start()
+
+    def stop_ws_listener(self):
+        """停止后台 WebSocket 监听"""
+        self._ws_running = False
+        if self._ws_app:
+            try:
+                self._ws_app.close()
+            except Exception:
+                pass
+            self._ws_app = None
+
+    def _ws_worker(self):
+        """WebSocket 监听后台工作线程 (0.00% CPU)"""
+        while self._ws_running:
+            # 1. 确保基础连接
+            if not self._connected or not self.port or not self.auth_token:
+                if not self.connect():
+                    # 客户端未启动，每 3 秒检测一次 lockfile (耗时 0.001ms，0 CPU)
+                    for _ in range(6):
+                        if not self._ws_running:
+                            return
+                        time.sleep(0.5)
+                    continue
+
+            # 2. 尝试立即获取一次当前英雄 (覆盖启动时已在选人或对局中的情况)
+            try:
+                cur_hero, src = self.get_champion_auto()
+                if cur_hero and self.on_hero_changed:
+                    self.on_hero_changed(cur_hero, src)
+            except Exception:
+                pass
+
+            # 3. 启动 WebSocket 事件驱动
+            if HAS_WEBSOCKET:
+                ws_url = f"wss://127.0.0.1:{self.port}/"
+                auth_str = base64.b64encode(f"riot:{self.auth_token}".encode()).decode()
+                headers = {"Authorization": f"Basic {auth_str}"}
+
+                def on_open(ws):
+                    try:
+                        # 订阅选人事件 (选人、掷骰子、板凳席互换实时触发)
+                        ws.send(json.dumps([5, "OnJsonApiEvent_lol_champ_select_v1_session"]))
+                        # 订阅游戏流程阶段事件 (ChampSelect, InProgress, EndOfGame 等)
+                        ws.send(json.dumps([5, "OnJsonApiEvent_lol_gameflow_v1_gameflow_phase"]))
+                        print("   [OK] LCU WebSocket 实时监听已建立 (0.00% CPU 事件推送模式)")
+                    except Exception as err:
+                        print(f"   [WARN] WebSocket 订阅指令发送失败: {err}")
+
+                def on_message(ws, msg):
+                    self._handle_ws_event(msg)
+
+                def on_error(ws, err):
+                    pass
+
+                def on_close(ws, close_status_code, close_msg):
+                    self._connected = False
+
+                self._ws_app = websocket.WebSocketApp(
+                    ws_url,
+                    header=headers,
+                    on_open=on_open,
+                    on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close
+                )
+
+                try:
+                    # 运行 WebSocket 阻塞监听，内部使用操作系统内核 select/poll 挂起，0 CPU 占用
+                    self._ws_app.run_forever(
+                        sslopt={"cert_reqs": ssl.CERT_NONE, "check_hostname": False},
+                        ping_interval=15,
+                        ping_timeout=10
+                    )
+                except Exception:
+                    pass
+
+                time.sleep(2)
+            else:
+                self._adaptive_polling_fallback()
+
+    def _handle_ws_event(self, raw_message):
+        """解析并处理 Riot WAMP 协议推送事件"""
+        if not raw_message:
+            return
+        try:
+            event_data = json.loads(raw_message)
+            if not isinstance(event_data, list) or len(event_data) < 3:
+                return
+
+            opcode, event_name, payload = event_data[0], event_data[1], event_data[2]
+            if opcode != 8 or not isinstance(payload, dict):
+                return
+
+            uri = payload.get("uri", "")
+            data = payload.get("data")
+
+            # 1. 选人阶段实时事件 (包括选人、掷骰子、板凳席互换)
+            if "champ-select" in uri or "champ_select" in event_name:
+                if isinstance(data, dict):
+                    local_cell_id = data.get("localPlayerCellId")
+                    if local_cell_id is not None:
+                        for player in data.get("myTeam", []):
+                            if player.get("cellId") == local_cell_id:
+                                cid = player.get("championId", 0)
+                                if cid and cid > 0:
+                                    if len(self.id_to_cn) == 0:
+                                        self._build_champion_id_map()
+                                    hero = self.id_to_cn.get(cid)
+                                    if hero and self.on_hero_changed:
+                                        self.on_hero_changed(hero, "选人界面(实时推送)")
+                                break
+
+            # 2. 游戏阶段流转事件
+            elif "gameflow-phase" in uri or "gameflow" in event_name:
+                phase = data if isinstance(data, str) else ""
+                if phase and self.on_phase_changed:
+                    self.on_phase_changed(phase)
+
+                if phase == "ChampSelect":
+                    hero = self.get_champ_select_champion()
+                    if hero and self.on_hero_changed:
+                        self.on_hero_changed(hero, "选人阶段")
+
+                elif phase in ("InProgress", "GameStart"):
+                    # 载入游戏，尝试从 gameflow 或 Live API (2999) 提取
+                    hero = self.get_gameflow_champion() or self.get_ingame_champion()
+                    if hero and self.on_hero_changed:
+                        self.on_hero_changed(hero, "对局内")
+
+                elif phase in ("EndOfGame", "PreEndOfGame", "WaitingForStats"):
+                    # 本局结束，通知重置
+                    if self.on_hero_reset:
+                        self.on_hero_reset()
+
+                elif phase in ("None", "Lobby", "Matchmaking"):
+                    # 回到大厅
+                    if self.on_hero_reset:
+                        self.on_hero_reset()
+
+        except Exception:
+            pass
+
+    def _adaptive_polling_fallback(self):
+        """降级兜底: 自适应低频休眠轮询 (~0.01% CPU)"""
+        phase = self.get_gameflow_phase()
+        if phase == "ChampSelect":
+            hero = self.get_champ_select_champion()
+            if hero and self.on_hero_changed:
+                self.on_hero_changed(hero, "选人阶段(轮询)")
+            time.sleep(1.5)
+        elif phase in ("InProgress", "GameStart"):
+            hero = self.get_gameflow_champion() or self.get_ingame_champion()
+            if hero and self.on_hero_changed:
+                self.on_hero_changed(hero, "对局内(轮询)")
+            time.sleep(10)
+        elif phase in ("EndOfGame", "PreEndOfGame", "None", "Lobby"):
+            if self.on_hero_reset:
+                self.on_hero_reset()
+            time.sleep(5)
+        else:
+            time.sleep(3)

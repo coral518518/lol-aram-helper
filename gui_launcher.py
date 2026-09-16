@@ -115,13 +115,29 @@ class GUIController(threading.Thread):
         self._last_f8 = 0
 
     def run(self):
-        """主循环: 自动检测 → 监听"""
-        while self.running:
-            self._auto_detect_phase()
-            self._listening_phase()
+        """主循环: 启动 LCU WebSocket 实时监听 + 键盘监听"""
+        if self.lcu:
+            # 开启 0% CPU 实时事件流监听
+            self.lcu.start_ws_listener(
+                on_hero_changed=self._on_ws_hero_changed,
+                on_phase_changed=self._on_ws_phase_changed,
+                on_hero_reset=self._on_ws_hero_reset
+            )
+
+        # 启动时快速探查一次 (覆盖启动时已在选人或对局中的场景)
+        hero, source = self._try_auto_detect(verbose=False)
+        if hero:
+            self._apply_hero(hero, source)
+        else:
+            self._gui(event="status", status="idle")
+            self.overlay_queue.put({"cmd": "STATUS", "data": "暂无英雄\n等待选人中..."})
+
+        self._listening_phase()
 
     def stop(self):
         self.running = False
+        if self.lcu:
+            self.lcu.stop_ws_listener()
 
     def _gui(self, **kwargs):
         """发送消息到 GUI"""
@@ -130,6 +146,39 @@ class GUIController(threading.Thread):
     def _validate_hero(self, name):
         """验证英雄名是否在数据库中，尝试模糊映射"""
         return self.dm.validate_hero(name)
+
+    def _apply_hero(self, hero, source):
+        """统一设置并应用英雄变动"""
+        validated = self._validate_hero(hero)
+        if not validated:
+            return
+        if validated != self.current_hero:
+            old = self.current_hero
+            self.current_hero = validated
+            if old:
+                print(f"🔄 英雄已自动切换 ({source}): {old} → {validated}")
+            else:
+                print(f"✅ 自动识别到英雄: [{validated}] (来源: {source})")
+            self._gui(event="hero_found", hero=validated, source=source)
+            self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析"})
+        else:
+            self._gui(event="hero_confirmed", hero=validated)
+
+    def _on_ws_hero_changed(self, hero, source):
+        """WebSocket 监听到英雄变动 (选人、掷骰子、板凳席互换、进游戏)"""
+        self._apply_hero(hero, source)
+
+    def _on_ws_phase_changed(self, phase):
+        """WebSocket 监听到游戏流程阶段变更"""
+        pass
+
+    def _on_ws_hero_reset(self):
+        """对局结束或返回大厅，自动重置英雄"""
+        if self.current_hero:
+            print("🏁 对局结束或返回大厅，自动重置英雄，就绪等待下局选人")
+            self.current_hero = None
+            self._gui(event="status", status="idle")
+            self.overlay_queue.put({"cmd": "STATUS", "data": "对局结束\n等待下局选人..."})
 
     def _try_auto_detect(self, verbose=False):
         if not self.lcu:
@@ -168,55 +217,17 @@ class GUIController(threading.Thread):
         """手动设置英雄 (供 GUI 调用)"""
         validated = self._validate_hero(hero_name)
         if validated:
-            self.current_hero = validated
-            print(f"✅ 已手动锁定英雄: {validated}")
-            self._gui(event="hero_found", hero=validated, source="手动输入")
-            self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析"})
+            self._apply_hero(validated, "手动输入")
             return validated
         return None
 
-    # ---------- 阶段1: 自动检测英雄 ----------
-
-    def _auto_detect_phase(self):
-        if not self.running:
-            return
-        self._gui(event="status", status="connecting")
-        print("正在连接英雄联盟客户端...")
-
-        for attempt in range(15):  # 30秒轮询
-            if not self.running:
-                return
-
-            # 第一次和每5次详细输出
-            verbose = (attempt == 0 or attempt % 5 == 0)
-            hero, source = self._try_auto_detect(verbose=verbose)
-            if hero:
-                self.current_hero = hero
-                print(f"✅ 自动识别到英雄: [{hero}] (来源: {source})")
-                self._gui(event="hero_found", hero=hero, source=source)
-                self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析"})
-                return
-
-            # F8 中断自动检测
-            if keyboard.is_pressed('f8'):
-                break
-
-            self._gui(event="status", status="waiting", attempt=attempt)
-            time.sleep(2)
-
-        # 超时未检测到
-        print("暂未检测到英雄，可在上方手动输入英雄名")
-        print("提示: 如果客户端已打开，请尝试以管理员身份运行本程序")
-        self._gui(event="status", status="idle")
-        self.overlay_queue.put({"cmd": "STATUS", "data": "暂无英雄\n按 F7 或手动输入"})
-
-    # ---------- 阶段2: 热键监听 ----------
+    # ---------- 热键监听循环 ----------
 
     def _listening_phase(self):
         if not self.running:
             return
         self._gui(event="status", status="listening", hero=self.current_hero)
-        print(f"热键监听中... 当前英雄: {self.current_hero or '未指定'}")
+        print(f"热键监听中... 当前英雄: {self.current_hero or '未指定'} | F6分析 / F7刷新 / F8重置")
 
         while self.running:
             now = time.time()
@@ -225,45 +236,41 @@ class GUIController(threading.Thread):
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
                 self._last_f6 = now
                 if not self.current_hero:
-                    self.overlay_queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 获取"})
+                    # 尝试自动检测一下，以防刚好已进入游戏内
+                    hero, source = self._try_auto_detect()
+                    if hero:
+                        self._apply_hero(hero, source)
+
+                if not self.current_hero:
+                    self.overlay_queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 获取或上方输入"})
                     self._gui(event="status", status="no_hero_warning")
                 else:
                     self._gui(event="status", status="analyzing", hero=self.current_hero)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"🔎 分析 [{self.current_hero}]..."})
                     print(f"正在分析: {self.current_hero}...")
                     results = self.analyzer.analyze(self.current_hero)
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
                     print(f"分析完成: {self.current_hero}")
 
-            # F7 - 刷新英雄
+            # F7 - 手动刷新英雄 (备用)
             if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
                 self._last_f7 = now
                 self._gui(event="status", status="refreshing")
                 self.overlay_queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
-                hero, source = self._try_auto_detect()
-                if hero and hero != self.current_hero:
-                    old = self.current_hero
-                    self.current_hero = hero
-                    print(f"英雄已切换 ({source}): {old} → {hero}")
-                    self._gui(event="hero_found", hero=hero, source=source)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"已切换: {hero}\n按 F6 分析"})
-                elif hero:
-                    self._gui(event="hero_confirmed", hero=hero)
-                    self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {hero}\n按 F6 分析"})
+                hero, source = self._try_auto_detect(verbose=True)
+                if hero:
+                    self._apply_hero(hero, source)
                 else:
                     self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero or '未知'}\n按 F6 分析"})
 
-            # F8 - 重新进入自动检测
+            # F8 - 手动重置英雄
             if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
                 self._last_f8 = now
-                print("F8: 重新进入自动检测阶段")
-                self._gui(event="status", status="resetting")
-                self.current_hero = None
+                print("F8: 手动重置英雄状态")
+                self._on_ws_hero_reset()
                 time.sleep(0.5)
-                return  # 退出 listening_phase, 回到 auto_detect
 
-            time.sleep(0.1)  # 优化: 0.05 -> 0.1, 降低热键轮询 CPU 唤醒频率
+            time.sleep(0.1)  # 保持 10Hz 轮询键盘输入，0.0% CPU
 
 
 # ================= 系统托盘管理 =================
@@ -1075,6 +1082,8 @@ class LauncherApp:
             hero = msg.get("hero")
             if hero:
                 self.hero_var.set(hero)
+            elif status in ("idle", "resetting"):
+                self.hero_var.set("—")
             status_map = {
                 "connecting":       ("连接客户端...", self.WARNING),
                 "waiting":          ("等待选取英雄...", self.WARNING),

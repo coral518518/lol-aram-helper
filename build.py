@@ -97,6 +97,8 @@ def build():
         "--hidden-import", "thefuzz",
         "--hidden-import", "rapidfuzz",
         "--hidden-import", "onnxruntime",
+        "--hidden-import", "keyboard",
+        "--hidden-import", "websocket",
         "--hidden-import", "scripts",
         "--hidden-import", "scripts.lcu_connector",
         "--hidden-import", "scripts.hero_scraper",

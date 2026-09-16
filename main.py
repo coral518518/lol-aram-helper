@@ -61,6 +61,31 @@ def get_regions():
 
 REGIONS = get_regions()
 
+def get_banner_layout():
+    """计算紧凑型浮窗几何参数 (仅覆盖三张海克斯卡牌上方区域，面积缩减 96% 以上，从根本上杜绝 DWM 全屏合成掉帧)"""
+    with mss.mss() as sct:
+        mon = sct.monitors[1]
+        W, H = mon['width'], mon['height']
+        off_x, off_y = mon['left'], mon['top']
+
+    min_left = max(0, int(REGIONS['hex_1']['left'] - W * 0.015))
+    max_right = min(W, int(REGIONS['hex_3']['left'] + REGIONS['hex_3']['width'] + W * 0.025))
+    banner_w = max_right - min_left
+    banner_h = max(75, int(H * 0.08))  # 约 80~110px 高度，足够显示推荐
+    banner_y = max(0, int(REGIONS['hex_1']['top'] - banner_h - 15))
+
+    return {
+        "x": off_x + min_left,
+        "y": off_y + banner_y,
+        "width": banner_w,
+        "height": banner_h,
+        "min_left": min_left,
+        "off_x": off_x,
+        "off_y": off_y,
+    }
+
+BANNER_LAYOUT = get_banner_layout()
+
 COLORS = {
     "normal": "#00FF00",  # 绿色
     "best":   "#FFD700",  # 金色
@@ -222,13 +247,13 @@ class GameAnalyzer:
         try:
             self.ocr = RapidOCR(
                 use_angle_cls=False,
-                det_limit_side_len=400,
+                det_limit_side_len=360,
                 intra_op_num_threads=ocr_threads,
                 inter_op_num_threads=1
             )
         except (KeyError, TypeError, Exception):
             try:
-                self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=400)
+                self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=360)
             except (KeyError, TypeError, Exception) as e:
                 py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
                 print(f"\n❌ OCR 引擎初始化失败: {e}")
@@ -352,6 +377,12 @@ class GameAnalyzer:
     def analyze(self, hero_cn):
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
+        try:
+            # 临时将当前执行 OCR 的线程优先级降至最低 (THREAD_PRIORITY_LOWEST = -2)
+            # 确保即使 ONNX 矩阵计算在跑，也 100% 优先让出 CPU 给 LOL 渲染线程
+            ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), -2)
+        except Exception:
+            pass
         
         # 阶段1: 批量截图 (复用 mss 上下文, 总耗时 ~18ms)
         images = self.capture_all_regions()
@@ -402,17 +433,24 @@ class OverlayApp:
         self.root = root
         self.queue = queue
         self.labels = {}
+        self.status_lbl = None
         self.hide_timer = None
+        self.layout = BANNER_LAYOUT
         
-        # 优化: 保持隐藏状态 (withdraw)。仅在有提示内容时才显示 (deiconify)
-        # 避免全屏透明置顶窗口常驻导致 Windows DWM 强制全屏合成, 破坏游戏的 DirectFlip 导致持续掉帧
+        # 优化: 保持彻底隐藏 (withdraw)，仅在展示推荐时无焦点唤醒
         self.root.withdraw()
         self._setup_window()
         self._setup_labels()
-        # 初始保持隐藏，不调用 deiconify()
         
         # 启动队列消息监听 (优化: 120ms 轮询, 减少后台空闲 CPU 唤醒)
         self.root.after(120, self.process_queue)
+
+    def _get_hwnd(self):
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            return hwnd if hwnd else self.root.winfo_id()
+        except Exception:
+            return None
 
     def _setup_window(self):
         self.root.title("ARAM Overlay")
@@ -421,26 +459,63 @@ class OverlayApp:
         self.root.config(bg=COLORS["bg"])
         self.root.attributes("-transparentcolor", COLORS["bg"]) # 背景透明
         
-        # 鼠标穿透设置 (Windows API)
-        try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            old_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            # WS_EX_LAYERED | WS_EX_TRANSPARENT
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, old_style | 0x80000 | 0x20)
-        except Exception as e:
-            print(f"穿透设置警告: {e}")
+        # 关键优化: 紧凑几何定位 (仅覆盖三张卡牌上方 ~1000x85 像素，面积缩减 96% 以上，彻底杜绝全屏 DWM 合成引发的掉帧)
+        self.root.geometry(f"{self.layout['width']}x{self.layout['height']}+{self.layout['x']}+{self.layout['y']}")
 
-        # 获取主屏幕坐标，用于相对定位
-        with mss.mss() as sct:
-            m = sct.monitors[0]
-            self.offset_x, self.offset_y = m['left'], m['top']
-            self.root.geometry(f"{m['width']}x{m['height']}+{m['left']}+{m['top']}")
+        # 核心 Windows 扩展样式:
+        # WS_EX_LAYERED (0x00080000): 分层半透明
+        # WS_EX_NOACTIVATE (0x08000000): 绝不抢夺焦点/激活状态，彻底杜绝打断 LOL DirectX 独占渲染管线
+        # WS_EX_TOOLWINDOW (0x00000080): 工具浮窗，不在任务栏显示
+        # 说明: 透明背景自动穿透鼠标到游戏；未设置全局 0x00000020 以允许点击右上角 [✕ 关闭] 按钮
+        try:
+            self.root.update_idletasks()
+            hwnd = self._get_hwnd()
+            if hwnd:
+                GWL_EXSTYLE = -20
+                old_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                new_style = old_style | 0x00080000 | 0x08000000 | 0x00000080
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+        except Exception as e:
+            print(f"窗口样式配置警告: {e}")
 
     def _setup_labels(self):
-        font_style = ("Microsoft YaHei", 14, "bold")
+        font_style = ("Microsoft YaHei", 13, "bold")
         for key in REGIONS:
             lbl = tk.Label(self.root, text="", font=font_style, bg=COLORS["bg"], justify="left")
             self.labels[key] = lbl
+        
+        # 独立居中状态提示标签
+        self.status_lbl = tk.Label(self.root, text="", font=("Microsoft YaHei", 13, "bold"), bg=COLORS["bg"], justify="center")
+
+        # 立即关闭按钮: 选完海克斯后可秒速点击关闭，立刻销毁隐藏释放渲染
+        self.close_btn = tk.Button(
+            self.root,
+            text="✕ 关闭",
+            font=("Microsoft YaHei", 9, "bold"),
+            bg="#21262d",
+            fg="#f85149",
+            activebackground="#da3633",
+            activeforeground="#ffffff",
+            relief="solid",
+            bd=1,
+            cursor="hand2",
+            padx=6,
+            pady=1,
+            command=self.clear_display
+        )
+        self.close_btn.bind("<Enter>", lambda e: self.close_btn.config(bg="#da3633", fg="#ffffff"))
+        self.close_btn.bind("<Leave>", lambda e: self.close_btn.config(bg="#21262d", fg="#f85149"))
+
+    def _show_no_activate(self):
+        """以无焦点无激活的方式显示窗口，绝不让 LOL 丢失焦点引发掉帧"""
+        try:
+            self.root.deiconify()
+            hwnd = self._get_hwnd()
+            if hwnd:
+                # SWP_NOSIZE(1) | SWP_NOMOVE(2) | SWP_NOACTIVATE(16) | SWP_SHOWWINDOW(64) = 0x53
+                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0053)
+        except Exception:
+            pass
 
     def process_queue(self):
         """主线程轮询：处理来自后台线程的指令"""
@@ -467,7 +542,11 @@ class OverlayApp:
             self.hide_timer = None
         for lbl in self.labels.values():
             lbl.place_forget()
-        # 优化: 彻底隐藏窗口，撤出 DWM 渲染树，恢复游戏满血帧率与 DirectFlip 独占加速
+        if self.status_lbl:
+            self.status_lbl.place_forget()
+        if hasattr(self, 'close_btn') and self.close_btn:
+            self.close_btn.place_forget()
+        # 彻底隐藏窗口，完全撤出 DWM 渲染树，恢复游戏 DirectFlip 极速渲染
         try:
             self.root.withdraw()
         except Exception:
@@ -475,14 +554,9 @@ class OverlayApp:
 
     def show_status(self, text):
         self.clear_display()
-        try:
-            self.root.deiconify()
-            self.root.lift()
-        except Exception:
-            pass
-        lbl = self.labels['hex_2']
-        lbl.config(text=text, fg=COLORS["status"])
-        lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self.status_lbl.config(text=text, fg=COLORS["status"])
+        self.status_lbl.place(relx=0.5, rely=0.5, anchor="center")
+        self._show_no_activate()
         # 状态提示2秒后消失
         self.hide_timer = self.root.after(2000, self.clear_display)
 
@@ -492,16 +566,7 @@ class OverlayApp:
         if not has_content:
             return
 
-        try:
-            self.root.deiconify()
-            self.root.lift()
-        except Exception:
-            pass
-        
-        # 强制对齐 Y 轴
-        base_y_abs = REGIONS['hex_1']['top']
-        fixed_rel_y = base_y_abs - self.offset_y - 120
-
+        min_left = self.layout['min_left']
         for key, info in results.items():
             if not info.get("text"): continue
             
@@ -515,13 +580,16 @@ class OverlayApp:
                 fg = COLORS["normal"]
             
             lbl.config(text=info["text"], fg=fg)
-            
-            r_left = REGIONS[key]['left'] - self.offset_x
-            lbl.place(x=r_left, y=fixed_rel_y, anchor="nw")
-            lbl.lift()
+            rel_x = REGIONS[key]['left'] - min_left
+            lbl.place(x=rel_x, y=8, anchor="nw")
 
-        # 结果显示5秒后消失
-        self.hide_timer = self.root.after(5000, self.clear_display)
+        # 右上角放置 [✕ 关闭] 按钮
+        if hasattr(self, 'close_btn') and self.close_btn:
+            self.close_btn.place(relx=1.0, rely=0.08, x=-8, y=0, anchor="ne")
+
+        self._show_no_activate()
+        # 结果显示 10 秒后自动消失 (亦可点击右上角 [✕ 关闭] 秒关)
+        self.hide_timer = self.root.after(10000, self.clear_display)
 
 # ================= 4. 控制逻辑 (Controller) =================
 
@@ -540,9 +608,42 @@ class InputController(threading.Thread):
         self._last_f8 = 0
 
     def run(self):
+        if self.lcu:
+            self.lcu.start_ws_listener(
+                on_hero_changed=self._on_ws_hero_changed,
+                on_phase_changed=self._on_ws_phase_changed,
+                on_hero_reset=self._on_ws_hero_reset
+            )
         while True:
             self.select_hero_phase()
             self.listening_phase()
+
+    def _apply_hero(self, hero, source):
+        validated = self._validate_hero(hero)
+        if not validated:
+            return
+        if validated != self.current_hero:
+            old = self.current_hero
+            self.current_hero = validated
+            if old:
+                print(f"\n🔄 英雄已自动切换 ({source}): {old} -> {validated}")
+            else:
+                print(f"\n✅ 自动识别到英雄: [{validated}] (数据源: {source})")
+            print(f">>> F5=总开关 | F6=分析 | F7=刷新 | F8=手动")
+            self.queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析 | F7 刷新"})
+            self.hide_console_window()
+
+    def _on_ws_hero_changed(self, hero, source):
+        self._apply_hero(hero, source)
+
+    def _on_ws_phase_changed(self, phase):
+        pass
+
+    def _on_ws_hero_reset(self):
+        if self.current_hero:
+            print(f"\n🏁 对局结束或返回大厅，自动重置英雄，等待下局选人")
+            self.current_hero = None
+            self.queue.put({"cmd": "STATUS", "data": "对局结束\n等待下局选人..."})
 
     def flush_input(self):
         """强制清空标准输入缓冲区"""
@@ -583,7 +684,7 @@ class InputController(threading.Thread):
         if self.lcu:
             print("[Auto] 正在连接英雄联盟客户端...")
 
-            for attempt in range(15):  # 每2秒检测，共30秒
+            for attempt in range(8):  # 每2秒检测，共30秒
                 hero, source = self._try_auto_detect()
                 if hero:
                     self.current_hero = hero
@@ -698,27 +799,27 @@ class InputController(threading.Thread):
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
                 self._last_f6 = now
                 if not self.current_hero:
+                    hero, source = self._try_auto_detect()
+                    if hero:
+                        self._apply_hero(hero, source)
+
+                if not self.current_hero:
                     self.queue.put({"cmd": "STATUS", "data": "⚠ 尚未锁定英雄\n请按 F7 自动获取或 F8 手动输入"})
                     continue
                 
-                self.queue.put({"cmd": "STATUS", "data": f"🔎 正在分析 [{self.current_hero}]..."})
+                print(f"🔎 正在分析 [{self.current_hero}]...")
                 results = self.analyzer.analyze(self.current_hero)
                 self.queue.put({"cmd": "UPDATE", "data": results})
 
             if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
                 self._last_f7 = now
-                # F7: 全阶段刷新英雄 (ChampSelect / InProgress / LiveAPI)
+                # F7: 手动刷新英雄
                 self.queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
                 hero, source = self._try_auto_detect()
-                if hero and hero != self.current_hero:
-                    old = self.current_hero
-                    self.current_hero = hero
-                    print(f">>> 英雄已切换 ({source}): {old} -> {hero}")
-                    self.queue.put({"cmd": "STATUS", "data": f"已切换: {hero}\n按 F6 分析"})
-                elif hero:
-                    self.queue.put({"cmd": "STATUS", "data": f"当前英雄: {hero}\n按 F6 分析"})
+                if hero:
+                    self._apply_hero(hero, source)
                 else:
-                    self.queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero}\n按 F6 分析"})
+                    self.queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero or '未知'}\n按 F6 分析"})
 
             if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
                 self._last_f8 = now

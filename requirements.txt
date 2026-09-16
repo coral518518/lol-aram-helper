@@ -13,3 +13,4 @@ psutil
 pystray
 Pillow
 pyinstaller
+websocket-client
