@@ -113,6 +113,8 @@ class GUIController(threading.Thread):
         self._last_f6 = 0
         self._last_f7 = 0
         self._last_f8 = 0
+        self._last_auto_check = 0
+        self._last_game_check = 0
 
     def run(self):
         """主循环: 启动 LCU WebSocket 实时监听 + 键盘监听"""
@@ -175,10 +177,37 @@ class GUIController(threading.Thread):
     def _on_ws_hero_reset(self):
         """对局结束或返回大厅，自动重置英雄"""
         if self.current_hero:
-            print("🏁 对局结束或返回大厅，自动重置英雄，就绪等待下局选人")
+            print(f"🏁 对局结束或返回大厅，自动重置英雄 [{self.current_hero}]，就绪等待下局选人")
             self.current_hero = None
             self._gui(event="status", status="idle")
             self.overlay_queue.put({"cmd": "STATUS", "data": "对局结束\n等待下局选人..."})
+
+    def _check_game_ended(self):
+        """检测当前对局是否已结束，或选人阶段是否变更了英雄"""
+        if not self.lcu:
+            return
+
+        try:
+            if self.lcu.is_connected():
+                phase = self.lcu.get_gameflow_phase()
+                if phase in ("EndOfGame", "PreEndOfGame", "WaitingForStats", "None", "Lobby", "Matchmaking"):
+                    self._on_ws_hero_reset()
+                    return
+                elif phase == "ChampSelect":
+                    # 选人阶段可能掷骰子或交换了英雄
+                    hero = self.lcu.get_champ_select_champion()
+                    if hero and hero != self.current_hero:
+                        self._apply_hero(hero, "选人阶段(更新)")
+                    return
+
+            # 如果游戏内 Live API 连不上，且 LCU 报告不在对局中，重置
+            live_hero = self.lcu.get_ingame_champion()
+            if not live_hero:
+                phase = self.lcu.get_gameflow_phase() if self.lcu.is_connected() else None
+                if phase in ("EndOfGame", "PreEndOfGame", "WaitingForStats", "None", "Lobby", "Matchmaking"):
+                    self._on_ws_hero_reset()
+        except Exception:
+            pass
 
     def _try_auto_detect(self, verbose=False):
         if not self.lcu:
@@ -232,6 +261,21 @@ class GUIController(threading.Thread):
         while self.running:
             now = time.time()
 
+            # 1. 自动探查与流转监控 (双频自适应低频 Watchdog，<0.01% CPU)
+            if not self.current_hero:
+                # 未锁定英雄（等待选人或下局）：每 2 秒极速静默探查
+                if now - self._last_auto_check >= 2.0:
+                    self._last_auto_check = now
+                    hero, source = self._try_auto_detect(verbose=False)
+                    if hero:
+                        self._apply_hero(hero, source)
+            else:
+                # 已锁定英雄（对局进行中）：停止探查 (0% CPU)，每 4 秒轻量检测对局结束或选人变动
+                if now - self._last_game_check >= 4.0:
+                    self._last_game_check = now
+                    self._check_game_ended()
+
+            # 2. 热键处理
             # F6 - 分析海克斯
             if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
                 self._last_f6 = now

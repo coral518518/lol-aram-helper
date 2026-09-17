@@ -29,20 +29,28 @@ except ImportError:
 # 禁用 SSL 自签名证书警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 常见的英雄联盟安装路径（用于 lockfile 备选读取）
+# 常见的英雄联盟安装路径（用于 lockfile 备选读取，覆盖腾讯 WeGame 国服与拳头官方外服）
 COMMON_INSTALL_PATHS = [
+    r"C:\WeGameApps\英雄联盟",
+    r"D:\WeGameApps\英雄联盟",
+    r"E:\WeGameApps\英雄联盟",
+    r"F:\WeGameApps\英雄联盟",
+    r"C:\WeGame\英雄联盟",
+    r"D:\WeGame\英雄联盟",
+    r"E:\WeGame\英雄联盟",
+    r"F:\WeGame\英雄联盟",
+    r"C:\腾讯游戏\英雄联盟",
+    r"D:\腾讯游戏\英雄联盟",
+    r"E:\腾讯游戏\英雄联盟",
+    r"F:\腾讯游戏\英雄联盟",
+    r"C:\Riot Games\英雄联盟",
+    r"D:\Riot Games\英雄联盟",
+    r"E:\Riot Games\英雄联盟",
     r"C:\Riot Games\League of Legends",
     r"D:\Riot Games\League of Legends",
     r"E:\Riot Games\League of Legends",
     r"C:\Program Files\Riot Games\League of Legends",
     r"D:\Program Files\Riot Games\League of Legends",
-    r"C:\Riot Games\英雄联盟",
-    r"D:\Riot Games\英雄联盟",
-    r"D:\WeGameApps\英雄联盟",
-    r"D:\WeGame\英雄联盟",
-    r"E:\WeGame\英雄联盟",
-    r"D:\腾讯游戏\英雄联盟",
-    r"E:\腾讯游戏\英雄联盟",
 ]
 
 
@@ -140,12 +148,47 @@ class LCUConnector:
             pass
         return False
 
-    def _connect_via_lockfile(self):
-        """通过读取 lockfile 获取连接信息 (优化: 优先检查缓存路径)"""
-        paths_to_check = []
+    def _get_potential_lockfile_paths(self):
+        """获取所有潜在的 lockfile 路径（优先检查缓存、国服 WeGame 注册表、LeagueClient 子目录）"""
+        paths = []
         if self._cached_lockfile_path:
-            paths_to_check.append(self._cached_lockfile_path)
-        paths_to_check.extend([os.path.join(p, 'lockfile') for p in COMMON_INSTALL_PATHS])
+            paths.append(self._cached_lockfile_path)
+
+        # 1. 尝试从 Windows 注册表直接读取国服腾讯 WeGame / LOL 真实安装路径
+        try:
+            import winreg
+            reg_keys = [
+                (winreg.HKEY_CURRENT_USER, r"Software\Tencent\LOL", "InstallPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\LOL", "InstallPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\LOL", "InstallPath"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Riot Games, Inc.\League of Legends", "Location"),
+            ]
+            for root, subkey, val_name in reg_keys:
+                try:
+                    with winreg.OpenKey(root, subkey) as k:
+                        val, _ = winreg.QueryValueEx(k, val_name)
+                        if val:
+                            for sub in ('LeagueClient', ''):
+                                p = os.path.join(val, sub, 'lockfile') if sub else os.path.join(val, 'lockfile')
+                                if p not in paths:
+                                    paths.append(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2. 常见盘符安装路径 (兼容 WeGameApps, WeGame, 腾讯游戏, Riot Games 等)
+        for base_dir in COMMON_INSTALL_PATHS:
+            for sub in ('LeagueClient', ''):
+                p = os.path.join(base_dir, sub, 'lockfile') if sub else os.path.join(base_dir, 'lockfile')
+                if p not in paths:
+                    paths.append(p)
+
+        return paths
+
+    def _connect_via_lockfile(self):
+        """通过读取 lockfile 获取连接信息 (优化: 优先检查缓存路径与 WeGame 注册表路径)"""
+        paths_to_check = self._get_potential_lockfile_paths()
 
         for lockfile_path in paths_to_check:
             if os.path.exists(lockfile_path):
@@ -154,6 +197,9 @@ class LCUConnector:
                         content = f.read().strip()
                     parts = content.split(':')
                     if len(parts) >= 5:
+                        pid_str = parts[1]
+                        if pid_str.isdigit() and not psutil.pid_exists(int(pid_str)):
+                            continue  # 进程已不存在，说明为残留的死 lockfile
                         self.port = parts[2]
                         self.auth_token = parts[3]
                         self.base_url = f"https://127.0.0.1:{self.port}"
@@ -164,10 +210,20 @@ class LCUConnector:
         return False
 
     def _finalize_connection(self):
-        """连接成功后，配置长连接 Session + 构建英雄 ID 映射 + 缓存召唤师ID"""
-        self._connected = True
+        """连接成功后，配置长连接 Session + 探针验证 + 构建英雄 ID 映射 + 缓存召唤师ID"""
         if self.auth_token:
             self._session.auth = ('riot', self.auth_token)
+        # 发送轻量探针验证端口是否真实可用 (超时 1.0s)
+        try:
+            probe = self._session.get(f"{self.base_url}/lol-gameflow/v1/gameflow-phase", timeout=1.0)
+            if probe.status_code not in (200, 404):
+                self._connected = False
+                return False
+        except Exception:
+            self._connected = False
+            return False
+
+        self._connected = True
         self._build_champion_id_map()
         self._cache_summoner_id()
         print(f"   [OK] LCU connected (port: {self.port})")
@@ -196,6 +252,32 @@ class LCUConnector:
     # 英雄 ID 映射 + 召唤师信息
     # ==========================================
 
+    def _resolve_champion_id(self, cid):
+        """根据 championId 解析中文名称 (带多级缓存与在线查询)"""
+        if not cid or cid <= 0:
+            return None
+        if cid in self.id_to_cn:
+            return self.id_to_cn[cid]
+
+        if len(self.id_to_cn) == 0:
+            self._build_champion_id_map()
+            if cid in self.id_to_cn:
+                return self.id_to_cn[cid]
+
+        try:
+            resp = self._request('GET', f'/lol-game-data/assets/v1/champions/{cid}.json')
+            if resp and resp.status_code == 200:
+                champ_data = resp.json()
+                alias = champ_data.get('alias', '')
+                raw_name = champ_data.get('name', '')
+                cn_name = self.en_to_cn.get(alias.lower()) or (raw_name if raw_name else None)
+                if cn_name:
+                    self.id_to_cn[cid] = cn_name
+                    return cn_name
+        except Exception:
+            pass
+        return None
+
     def _build_champion_id_map(self):
         """从 LCU API 获取英雄数据，构建 ID -> 中文名映射"""
         resp = self._request('GET', '/lol-game-data/assets/v1/champion-summary.json')
@@ -206,9 +288,10 @@ class LCUConnector:
             for champ in champions:
                 cid = champ.get('id')
                 alias = champ.get('alias', '')
+                raw_name = champ.get('name', '')
                 if cid is None or cid == -1:
                     continue
-                cn_name = self.en_to_cn.get(alias.lower())
+                cn_name = self.en_to_cn.get(alias.lower()) or (raw_name if raw_name else None)
                 if cn_name:
                     self.id_to_cn[cid] = cn_name
             print(f"   [OK] ID map: {len(self.id_to_cn)} champions")
@@ -445,10 +528,11 @@ class LCUConnector:
 
                 def on_open(ws):
                     try:
-                        # 订阅选人事件 (选人、掷骰子、板凳席互换实时触发)
+                        # Riot LCU 标准 WAMP 协议: 订阅全局 JSON API 事件流 (包含选人、游戏流程等全部实时变更)
+                        ws.send(json.dumps([5, "OnJsonApiEvent"]))
                         ws.send(json.dumps([5, "OnJsonApiEvent_lol_champ_select_v1_session"]))
-                        # 订阅游戏流程阶段事件 (ChampSelect, InProgress, EndOfGame 等)
                         ws.send(json.dumps([5, "OnJsonApiEvent_lol_gameflow_v1_gameflow_phase"]))
+                        ws.send(json.dumps([5, "OnJsonApiEvent_lol_gameflow_v1_session"]))
                         print("   [OK] LCU WebSocket 实时监听已建立 (0.00% CPU 事件推送模式)")
                     except Exception as err:
                         print(f"   [WARN] WebSocket 订阅指令发送失败: {err}")
@@ -461,6 +545,8 @@ class LCUConnector:
 
                 def on_close(ws, close_status_code, close_msg):
                     self._connected = False
+                    self.port = None
+                    self.auth_token = None
 
                 self._ws_app = websocket.WebSocketApp(
                     ws_url,
@@ -510,16 +596,19 @@ class LCUConnector:
                             if player.get("cellId") == local_cell_id:
                                 cid = player.get("championId", 0)
                                 if cid and cid > 0:
-                                    if len(self.id_to_cn) == 0:
-                                        self._build_champion_id_map()
-                                    hero = self.id_to_cn.get(cid)
+                                    hero = self._resolve_champion_id(cid)
                                     if hero and self.on_hero_changed:
                                         self.on_hero_changed(hero, "选人界面(实时推送)")
                                 break
 
-            # 2. 游戏阶段流转事件
-            elif "gameflow-phase" in uri or "gameflow" in event_name:
-                phase = data if isinstance(data, str) else ""
+            # 2. 游戏阶段流转事件 (gameflow-phase 或 gameflow/session)
+            elif "gameflow-phase" in uri or "gameflow" in event_name or "/lol-gameflow/v1/session" in uri:
+                phase = ""
+                if isinstance(data, str):
+                    phase = data
+                elif isinstance(data, dict):
+                    phase = data.get("phase", "")
+
                 if phase and self.on_phase_changed:
                     self.on_phase_changed(phase)
 
@@ -534,13 +623,8 @@ class LCUConnector:
                     if hero and self.on_hero_changed:
                         self.on_hero_changed(hero, "对局内")
 
-                elif phase in ("EndOfGame", "PreEndOfGame", "WaitingForStats"):
-                    # 本局结束，通知重置
-                    if self.on_hero_reset:
-                        self.on_hero_reset()
-
-                elif phase in ("None", "Lobby", "Matchmaking"):
-                    # 回到大厅
+                elif phase in ("EndOfGame", "PreEndOfGame", "WaitingForStats", "None", "Lobby", "Matchmaking"):
+                    # 本局结束或回到大厅，通知重置
                     if self.on_hero_reset:
                         self.on_hero_reset()
 
