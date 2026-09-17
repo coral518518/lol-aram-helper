@@ -10,6 +10,12 @@ import time
 import json
 import csv
 import sys
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 import threading
 import queue
 import tkinter as tk
@@ -49,15 +55,16 @@ def set_low_priority():
 # ================= 配置与常量 =================
 
 def get_regions():
-    """根据当前屏幕分辨率动态计算海克斯文字截取区域 (以 2K 2560x1440 为基准等比缩放)"""
+    """根据当前屏幕分辨率动态计算海克斯文字截取区域 (垂直居中完整包裹卡片标题)"""
     with mss.mss() as sct:
         mon = sct.monitors[1]  # 主显示器
         W, H = mon['width'], mon['height']
     return {
-        "hex_1": {'top': int(H * 0.375),  'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.0417)},
-        "hex_2": {'top': int(H * 0.375),  'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.0417)},
-        "hex_3": {'top': int(H * 0.375),  'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.0417)},
+        "hex_1": {'top': int(H * 0.385), 'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.052)},
+        "hex_2": {'top': int(H * 0.385), 'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.052)},
+        "hex_3": {'top': int(H * 0.385), 'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.052)},
     }
+
 
 REGIONS = get_regions()
 
@@ -241,36 +248,23 @@ class GameAnalyzer:
 
     def __init__(self, data_manager):
         self.dm = data_manager
-        self._cpu_count = os.cpu_count() or 4
-        # 优化: 针对低配 CPU 限制 OCR 推理线程数 (最多 2 线程，双核使用 1 线程)，留足 CPU 核心给游戏
-        ocr_threads = min(2, max(1, self._cpu_count // 2))
+        # 初始化 OCR 引擎
         try:
-            self.ocr = RapidOCR(
-                use_angle_cls=False,
-                det_limit_side_len=360,
-                intra_op_num_threads=ocr_threads,
-                inter_op_num_threads=1
-            )
-        except (KeyError, TypeError, Exception):
+            self.ocr = RapidOCR(use_angle_cls=False)
+        except Exception:
             try:
-                self.ocr = RapidOCR(use_angle_cls=False, det_limit_side_len=360)
-            except (KeyError, TypeError, Exception):
-                try:
-                    self.ocr = RapidOCR(use_angle_cls=False)
-                except (KeyError, TypeError, Exception):
-                    try:
-                        self.ocr = RapidOCR()
-                    except (KeyError, TypeError, Exception) as e:
-                        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-                        print(f"\n❌ OCR 引擎初始化失败: {e}")
-                        print(f"   当前 Python 版本: {py_ver}")
-                        if sys.version_info >= (3, 13):
-                            print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
-                        else:
-                            print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
-                        raise
-
-        # 仅在超多核心 (>=12 线程) 时开启并发，普通/低配 CPU 采用串行避免核争抢
+                self.ocr = RapidOCR()
+            except Exception as e:
+                py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                print(f"\n❌ OCR 引擎初始化失败: {e}")
+                print(f"   当前 Python 版本: {py_ver}")
+                if sys.version_info >= (3, 13):
+                    print(f"   ⚠ rapidocr_onnxruntime 仅支持 Python <3.13，请使用 Python 3.10~3.12")
+                else:
+                    print(f"   请尝试: pip install rapidocr_onnxruntime<=1.4.4")
+                raise
+        # 根据 CPU 逻辑核心数决定并发策略
+        self._cpu_count = os.cpu_count() or 4
         self._use_parallel = self._cpu_count >= 12
         self.executor = ThreadPoolExecutor(max_workers=3)
         self._match_cache = {}  # 模糊匹配结果缓存 (hero_cn, text) -> match_name
@@ -383,12 +377,6 @@ class GameAnalyzer:
     def analyze(self, hero_cn):
         if not hero_cn: return {}
         print(f"正在分析: {hero_cn}...")
-        try:
-            # 临时将当前执行 OCR 的线程优先级降至最低 (THREAD_PRIORITY_LOWEST = -2)
-            # 确保即使 ONNX 矩阵计算在跑，也 100% 优先让出 CPU 给 LOL 渲染线程
-            ctypes.windll.kernel32.SetThreadPriority(ctypes.windll.kernel32.GetCurrentThread(), -2)
-        except Exception:
-            pass
         
         # 阶段1: 批量截图 (复用 mss 上下文, 总耗时 ~18ms)
         images = self.capture_all_regions()
@@ -431,6 +419,7 @@ class GameAnalyzer:
                     results[item['key']]["highlight"] = True
         
         return results
+
 
 # ================= 3. UI 界面 (View) =================
 
@@ -524,10 +513,12 @@ class OverlayApp:
             pass
 
     def process_queue(self):
-        """主线程轮询：处理来自后台线程的指令"""
+        """主线程轮询：处理来自后台线程的指令 (优化: 自适应低频休眠)"""
+        has_msg = False
         try:
             while True:
                 msg = self.queue.get_nowait()
+                has_msg = True
                 cmd = msg.get("cmd")
                 data = msg.get("data")
                 
@@ -540,7 +531,13 @@ class OverlayApp:
         except queue.Empty:
             pass
         finally:
-            self.root.after(120, self.process_queue)
+            try:
+                is_visible = self.root.winfo_viewable()
+            except Exception:
+                is_visible = False
+            # 浮窗不可见且无任务时保持 250ms 静默休眠，展示时提升至 80ms
+            interval = 80 if (is_visible or has_msg) else 250
+            self.root.after(interval, self.process_queue)
 
     def clear_display(self):
         if self.hide_timer:
@@ -608,12 +605,58 @@ class InputController(threading.Thread):
         self.lcu = lcu_connector
         self.current_hero = None
         self.paused = False
+        self.action_queue = queue.Queue()
+        self._hotkeys_registered = False
         self._last_f5 = 0
         self._last_f6 = 0
         self._last_f7 = 0
         self._last_f8 = 0
         self._last_auto_check = 0
         self._last_game_check = 0
+
+    def _on_hotkey(self, key_name):
+        """全局热键事件回调 (防抖)"""
+        now = time.time()
+        if key_name == 'f5':
+            if now - self._last_f5 > 0.8:
+                self._last_f5 = now
+                self.action_queue.put('f5')
+        elif key_name == 'f6':
+            if now - self._last_f6 > 0.8:
+                self._last_f6 = now
+                self.action_queue.put('f6')
+        elif key_name == 'f7':
+            if now - self._last_f7 > 0.8:
+                self._last_f7 = now
+                self.action_queue.put('f7')
+        elif key_name == 'f8':
+            if now - self._last_f8 > 0.8:
+                self._last_f8 = now
+                self.action_queue.put('f8')
+
+    def _register_hotkeys(self):
+        """基于 Windows 底层钩子的事件驱动热键 (0% 算力，0 漏键)"""
+        if self._hotkeys_registered:
+            return
+        try:
+            keyboard.add_hotkey('f5', lambda: self._on_hotkey('f5'), suppress=False)
+            keyboard.add_hotkey('f6', lambda: self._on_hotkey('f6'), suppress=False)
+            keyboard.add_hotkey('f7', lambda: self._on_hotkey('f7'), suppress=False)
+            keyboard.add_hotkey('f8', lambda: self._on_hotkey('f8'), suppress=False)
+            self._hotkeys_registered = True
+        except Exception as e:
+            print(f"热键注册提示: {e}")
+
+    def _unregister_hotkeys(self):
+        """注销热键钩子"""
+        if not self._hotkeys_registered:
+            return
+        for k in ('f5', 'f6', 'f7', 'f8'):
+            try:
+                keyboard.remove_hotkey(k)
+            except Exception:
+                pass
+        self._hotkeys_registered = False
 
     def run(self):
         if self.lcu:
@@ -810,13 +853,18 @@ class InputController(threading.Thread):
     def listening_phase(self):
         self.flush_input()
         print(f"[监听中...] 当前英雄: {self.current_hero} | F5开关 / F6分析 / F7刷新 / F8手动")
+        self._register_hotkeys()
 
         while True:
+            # 核心优化: 操作系统事件驱动挂起，无按键时阻塞等待，0.00% CPU 占用
+            try:
+                action = self.action_queue.get(timeout=2.0)
+            except queue.Empty:
+                action = None
+
             now = time.time()
 
-            # F5 - 暂停/恢复总开关
-            if keyboard.is_pressed('f5') and now - self._last_f5 > 1.0:
-                self._last_f5 = now
+            if action == 'f5':
                 self.paused = not self.paused
                 if self.paused:
                     print(">>> [F5] 助手已暂停 (0% 算力占用)")
@@ -826,26 +874,9 @@ class InputController(threading.Thread):
                     self.queue.put({"cmd": "STATUS", "data": f"▶ 助手已恢复 (F5)\n当前: {self.current_hero or '未知'}"})
 
             if self.paused:
-                time.sleep(0.2)
                 continue
 
-            # 1. 自动探查与流转监控 (双频自适应低频 Watchdog，<0.01% CPU)
-            if not self.current_hero:
-                # 未锁定英雄（等待选人或下局）：每 2 秒极速静默探查
-                if now - self._last_auto_check >= 2.0:
-                    self._last_auto_check = now
-                    hero, source = self._try_auto_detect()
-                    if hero:
-                        self._apply_hero(hero, source)
-            else:
-                # 已锁定英雄（对局进行中）：停止高频探查 (0% CPU)，每 4 秒轻量检测对局结束或选人变动
-                if now - self._last_game_check >= 4.0:
-                    self._last_game_check = now
-                    self._check_game_ended()
-
-            # 2. 热键处理
-            if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
-                self._last_f6 = now
+            if action == 'f6':
                 if not self.current_hero:
                     hero, source = self._try_auto_detect()
                     if hero:
@@ -859,9 +890,7 @@ class InputController(threading.Thread):
                 results = self.analyzer.analyze(self.current_hero)
                 self.queue.put({"cmd": "UPDATE", "data": results})
 
-            if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
-                self._last_f7 = now
-                # F7: 手动刷新英雄
+            elif action == 'f7':
                 self.queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
                 hero, source = self._try_auto_detect()
                 if hero:
@@ -869,12 +898,22 @@ class InputController(threading.Thread):
                 else:
                     self.queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero or '未知'}\n按 F6 分析"})
 
-            if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
-                self._last_f8 = now
-                time.sleep(0.5)
+            elif action == 'f8':
+                self._unregister_hotkeys()
+                time.sleep(0.3)
                 return  # 退出监听，回到 select_hero_phase
 
-            time.sleep(0.1)  # 优化: 0.05 -> 0.1, 降低 CPU 唤醒频率
+            # 自动探查与流转监控 (未锁定英雄时每 2 秒静默探查，已锁定后每 5 秒轻量检测)
+            if not self.current_hero:
+                if now - self._last_auto_check >= 2.0:
+                    self._last_auto_check = now
+                    hero, source = self._try_auto_detect()
+                    if hero:
+                        self._apply_hero(hero, source)
+            else:
+                if now - self._last_game_check >= 5.0:
+                    self._last_game_check = now
+                    self._check_game_ended()
 
 
     @staticmethod

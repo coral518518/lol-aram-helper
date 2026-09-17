@@ -110,11 +110,52 @@ class GUIController(threading.Thread):
         self.lcu = lcu_connector
         self.current_hero = None
         self.running = True
+        self._hotkeys_registered = False
+        self._action_queue = queue.Queue()
         self._last_f6 = 0
         self._last_f7 = 0
         self._last_f8 = 0
         self._last_auto_check = 0
         self._last_game_check = 0
+
+    def _on_hotkey(self, key_name):
+        """热键回调 (防抖)"""
+        now = time.time()
+        if key_name == 'f6':
+            if now - self._last_f6 > 0.8:
+                self._last_f6 = now
+                self._action_queue.put('f6')
+        elif key_name == 'f7':
+            if now - self._last_f7 > 0.8:
+                self._last_f7 = now
+                self._action_queue.put('f7')
+        elif key_name == 'f8':
+            if now - self._last_f8 > 0.8:
+                self._last_f8 = now
+                self._action_queue.put('f8')
+
+    def _register_hotkeys(self):
+        """基于底层系统钩子的事件驱动热键 (0% 算力，0 漏键)"""
+        if self._hotkeys_registered:
+            return
+        try:
+            keyboard.add_hotkey('f6', lambda: self._on_hotkey('f6'), suppress=False)
+            keyboard.add_hotkey('f7', lambda: self._on_hotkey('f7'), suppress=False)
+            keyboard.add_hotkey('f8', lambda: self._on_hotkey('f8'), suppress=False)
+            self._hotkeys_registered = True
+        except Exception as e:
+            print(f"GUI 热键注册提示: {e}")
+
+    def _unregister_hotkeys(self):
+        """注销热键钩子"""
+        if not self._hotkeys_registered:
+            return
+        for k in ('f6', 'f7', 'f8'):
+            try:
+                keyboard.remove_hotkey(k)
+            except Exception:
+                pass
+        self._hotkeys_registered = False
 
     def run(self):
         """主循环: 启动 LCU WebSocket 实时监听 + 键盘监听"""
@@ -138,6 +179,8 @@ class GUIController(threading.Thread):
 
     def stop(self):
         self.running = False
+        self._unregister_hotkeys()
+        self._action_queue.put('stop')
         if self.lcu:
             self.lcu.stop_ws_listener()
 
@@ -163,8 +206,7 @@ class GUIController(threading.Thread):
                 print(f"✅ 自动识别到英雄: [{validated}] (来源: {source})")
             self._gui(event="hero_found", hero=validated, source=source)
             self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {validated}\n按 F6 分析"})
-        else:
-            self._gui(event="hero_confirmed", hero=validated)
+        # 优化: 英雄未改变时跳过重复派发，消除冗余 UI 重绘开销
 
     def _on_ws_hero_changed(self, hero, source):
         """WebSocket 监听到英雄变动 (选人、掷骰子、板凳席互换、进游戏)"""
@@ -257,30 +299,23 @@ class GUIController(threading.Thread):
             return
         self._gui(event="status", status="listening", hero=self.current_hero)
         print(f"热键监听中... 当前英雄: {self.current_hero or '未指定'} | F6分析 / F7刷新 / F8重置")
+        self._register_hotkeys()
 
         while self.running:
+            # 核心优化: 阻塞等待热键事件队列，空闲时 0.00% CPU
+            try:
+                action = self._action_queue.get(timeout=2.0)
+            except queue.Empty:
+                action = None
+
+            if not self.running or action == 'stop':
+                break
+
             now = time.time()
 
-            # 1. 自动探查与流转监控 (双频自适应低频 Watchdog，<0.01% CPU)
-            if not self.current_hero:
-                # 未锁定英雄（等待选人或下局）：每 2 秒极速静默探查
-                if now - self._last_auto_check >= 2.0:
-                    self._last_auto_check = now
-                    hero, source = self._try_auto_detect(verbose=False)
-                    if hero:
-                        self._apply_hero(hero, source)
-            else:
-                # 已锁定英雄（对局进行中）：停止探查 (0% CPU)，每 4 秒轻量检测对局结束或选人变动
-                if now - self._last_game_check >= 4.0:
-                    self._last_game_check = now
-                    self._check_game_ended()
-
-            # 2. 热键处理
-            # F6 - 分析海克斯
-            if keyboard.is_pressed('f6') and now - self._last_f6 > 1.0:
-                self._last_f6 = now
+            # 热键处理
+            if action == 'f6':
                 if not self.current_hero:
-                    # 尝试自动检测一下，以防刚好已进入游戏内
                     hero, source = self._try_auto_detect()
                     if hero:
                         self._apply_hero(hero, source)
@@ -290,15 +325,12 @@ class GUIController(threading.Thread):
                     self._gui(event="status", status="no_hero_warning")
                 else:
                     self._gui(event="status", status="analyzing", hero=self.current_hero)
-                    print(f"正在分析: {self.current_hero}...")
                     results = self.analyzer.analyze(self.current_hero)
                     self.overlay_queue.put({"cmd": "UPDATE", "data": results})
                     self._gui(event="status", status="analyzed", hero=self.current_hero)
                     print(f"分析完成: {self.current_hero}")
 
-            # F7 - 手动刷新英雄 (备用)
-            if keyboard.is_pressed('f7') and now - self._last_f7 > 1.0:
-                self._last_f7 = now
+            elif action == 'f7':
                 self._gui(event="status", status="refreshing")
                 self.overlay_queue.put({"cmd": "STATUS", "data": "刷新英雄..."})
                 hero, source = self._try_auto_detect(verbose=True)
@@ -307,14 +339,23 @@ class GUIController(threading.Thread):
                 else:
                     self.overlay_queue.put({"cmd": "STATUS", "data": f"当前: {self.current_hero or '未知'}\n按 F6 分析"})
 
-            # F8 - 手动重置英雄
-            if keyboard.is_pressed('f8') and now - self._last_f8 > 1.0:
-                self._last_f8 = now
+            elif action == 'f8':
                 print("F8: 手动重置英雄状态")
                 self._on_ws_hero_reset()
-                time.sleep(0.5)
 
-            time.sleep(0.1)  # 保持 10Hz 轮询键盘输入，0.0% CPU
+            # 1. 自动探查与流转监控 (未锁定英雄时每 2 秒静默探查，已锁定后每 5 秒轻量检测)
+            if not self.current_hero:
+                if now - self._last_auto_check >= 2.0:
+                    self._last_auto_check = now
+                    hero, source = self._try_auto_detect(verbose=False)
+                    if hero:
+                        self._apply_hero(hero, source)
+            else:
+                if now - self._last_game_check >= 5.0:
+                    self._last_game_check = now
+                    self._check_game_ended()
+
+        self._unregister_hotkeys()
 
 
 # ================= 系统托盘管理 =================
@@ -1059,6 +1100,8 @@ class LauncherApp:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        if self.engine_running:
+            self._start_pulse()
 
     # ==========================================
     # 队列消息处理
@@ -1215,14 +1258,19 @@ class LauncherApp:
         self.status_color = color
 
     def _start_pulse(self):
-        """启动状态指示灯脉冲动画 (优化: 最小化时挂起，显示时降频至 300ms)"""
+        """启动状态指示灯脉冲动画 (优化: 最小化时彻底停止，恢复时重启)"""
+        if getattr(self, '_pulse_running', False):
+            return
+        self._pulse_running = True
+
         def _pulse():
-            if not self.engine_running:
+            if not self.engine_running or not getattr(self, '_pulse_running', False):
+                self._pulse_running = False
                 return
-            # 如果窗口最小化到托盘/不可见，挂起动画更新，降低空跑 CPU 消耗
+            # 如果窗口最小化到托盘/不可见，彻底挂起动画，0 算力 0 定时器
             try:
                 if not self.root.winfo_viewable():
-                    self.root.after(500, _pulse)
+                    self._pulse_running = False
                     return
             except Exception:
                 pass

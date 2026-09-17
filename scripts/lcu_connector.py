@@ -71,11 +71,15 @@ class LCUConnector:
         self._cached_lockfile_path = None
         self._session = requests.Session()
         self._session.verify = False
+        self._live_session = requests.Session()
+        self._live_session.verify = False
+        self._last_proc_scan = 0
 
         # WebSocket 事件监听相关
         self._ws_app = None
         self._ws_thread = None
         self._ws_running = False
+        self._ws_active = False
         self.on_hero_changed = None   # callback(hero_name, source)
         self.on_phase_changed = None  # callback(phase)
         self.on_hero_reset = None     # callback()
@@ -395,9 +399,9 @@ class LCUConnector:
         仅在游戏进行中（Loading 结束后）可用。
         """
         try:
-            resp = requests.get(
+            resp = self._live_session.get(
                 'https://127.0.0.1:2999/liveclientdata/activeplayer',
-                verify=False, timeout=self.LIVE_API_TIMEOUT
+                timeout=self.LIVE_API_TIMEOUT
             )
             if resp.status_code == 200:
                 en_name = resp.json().get('championName', '')
@@ -489,9 +493,14 @@ class LCUConnector:
         self._ws_thread = threading.Thread(target=self._ws_worker, daemon=True, name="LCU-WebSocket")
         self._ws_thread.start()
 
+    def is_ws_active(self):
+        """返回 WebSocket 是否处于活跃推送状态"""
+        return self._ws_running and self._ws_active
+
     def stop_ws_listener(self):
         """停止后台 WebSocket 监听"""
         self._ws_running = False
+        self._ws_active = False
         if self._ws_app:
             try:
                 self._ws_app.close()
@@ -528,12 +537,13 @@ class LCUConnector:
 
                 def on_open(ws):
                     try:
-                        # Riot LCU 标准 WAMP 协议: 订阅全局 JSON API 事件流 (包含选人、游戏流程等全部实时变更)
+                        self._ws_active = True
+                        # Riot LCU 标准 WAMP 协议: 订阅全局 JSON API 事件流
                         ws.send(json.dumps([5, "OnJsonApiEvent"]))
                         ws.send(json.dumps([5, "OnJsonApiEvent_lol_champ_select_v1_session"]))
                         ws.send(json.dumps([5, "OnJsonApiEvent_lol_gameflow_v1_gameflow_phase"]))
                         ws.send(json.dumps([5, "OnJsonApiEvent_lol_gameflow_v1_session"]))
-                        print("   [OK] LCU WebSocket 实时监听已建立 (0.00% CPU 事件推送模式)")
+                        print("   [OK] LCU WebSocket 实时监听已建立 (事件驱动模式)")
                     except Exception as err:
                         print(f"   [WARN] WebSocket 订阅指令发送失败: {err}")
 
@@ -541,9 +551,10 @@ class LCUConnector:
                     self._handle_ws_event(msg)
 
                 def on_error(ws, err):
-                    pass
+                    self._ws_active = False
 
                 def on_close(ws, close_status_code, close_msg):
+                    self._ws_active = False
                     self._connected = False
                     self.port = None
                     self.auth_token = None
@@ -574,6 +585,10 @@ class LCUConnector:
     def _handle_ws_event(self, raw_message):
         """解析并处理 Riot WAMP 协议推送事件"""
         if not raw_message:
+            return
+        # 极速预过滤: 仅对可能包含选人与流程变动的消息做 json 解析 (0 算力跳过无关数据)
+        raw_lower = raw_message.lower()
+        if "champ" not in raw_lower and "gameflow" not in raw_lower:
             return
         try:
             event_data = json.loads(raw_message)
