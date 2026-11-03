@@ -1,7 +1,7 @@
 """
 ARAM 海克斯助手 - 一键打包脚本
 运行: python build.py
-输出: dist/ARAMHelper/
+输出: dist/最新版_ARAMHelper/ 以及 dist/build_<timestamp>/ARAMHelper/
 """
 import subprocess
 import shutil
@@ -45,7 +45,7 @@ def build():
     print(f"  模式: --onedir (单目录)")
     print(f"{'='*50}\n")
 
-    # 排除不需要的大型包 (Anaconda 环境中容易被拖进来)
+    # 排除不需要的大型包 (避免 Anaconda/全局环境拖入无关重型库)
     EXCLUDES = [
         "torch", "torchvision", "torchaudio",
         "scipy", "pandas", "matplotlib",
@@ -72,21 +72,21 @@ def build():
         sys.executable, "-m", "PyInstaller",
         "--onedir",
         "--noconsole",
-        "--uac-admin",           # 默认请求管理员权限
+        "--noupx",               # 禁用 UPX 压缩，彻底杜绝 MSVCP140/vcruntime 符号表损坏与 0xC0000005 崩溃
+        "--uac-admin",           # 默认请求管理员权限 (热键与前台获取必需)
         "--name", APP_NAME,
-        "--noconfirm",       # 不确认覆盖
-        "--clean",           # 清理缓存
+        "--noconfirm",           # 不确认覆盖
+        "--clean",               # 清理缓存
         "--distpath", unique_dist,
         
-        # 收集 rapidocr 完整包 (含 ONNX 模型)
+        # 收集 rapidocr 完整包 (含 ONNX 模型与字典)
         "--collect-all", "rapidocr_onnxruntime",
 
-        # numpy: 完整收集 (Anaconda 环境需要)
+        # numpy: 完整收集
         "--collect-all", "numpy",
 
-        # onnxruntime: 只收集数据文件和二进制, 不收集子模块 (避免拖入 torch)
-        "--collect-data", "onnxruntime",
-        "--collect-binaries", "onnxruntime",
+        # onnxruntime: 收集完整 native bindings 与配置
+        "--collect-all", "onnxruntime",
 
         # 运行时 hook: 修复 numpy 冻结环境检测
         "--runtime-hook", os.path.join("runtime_hooks", "fix_numpy.py"),
@@ -104,6 +104,7 @@ def build():
         "--hidden-import", "scripts.hero_scraper",
         "--hidden-import", "scripts.updater",
         "--hidden-import", "scripts.utils",
+        "--hidden-import", "main",
 
         ENTRY_POINT,
     ]
@@ -117,8 +118,6 @@ def build():
     if os.path.exists(ICON_PATH):
         cmd.insert(-1, "--icon")
         cmd.insert(-1, ICON_PATH)
-
-    # (原预清理逻辑已经上移)
 
     print("执行命令:")
     print(" ".join(cmd))
@@ -134,10 +133,10 @@ def build():
 
 
 def copy_runtime_files():
-    """复制运行时需要的数据文件到 dist 目录"""
+    """复制运行时需要的数据文件与权威 VC 运行时动态库到 dist 目录"""
     print("\n--- 复制运行时文件 ---")
 
-    # 复制 data/ 目录 (CSV, JSON - 用户可更新)
+    # 1. 复制 data/ 目录 (CSV, JSON - 用户可更新与离线纠错真理库)
     src_data = "data"
     dst_data = os.path.join(DIST_DIR, "data")
     if os.path.exists(src_data):
@@ -148,7 +147,7 @@ def copy_runtime_files():
     else:
         print(f"⚠ data/ 不存在，跳过")
 
-    # 复制 assets/ 目录 (图标)
+    # 2. 复制 assets/ 目录 (图标与素材)
     src_assets = "assets"
     dst_assets = os.path.join(DIST_DIR, "assets")
     if os.path.exists(src_assets):
@@ -159,102 +158,61 @@ def copy_runtime_files():
     else:
         print(f"⚠ assets/ 不存在，跳过")
 
-    print("✅ 运行时文件复制完成")
-
-
-def cleanup_bloat():
-    """移除不必要的大型 DLL (CUDA/TensorRT/MKL 等)"""
-    import glob
-    internal = os.path.join(DIST_DIR, "_internal")
-    if not os.path.exists(internal):
-        return
-
-    print("\n--- 清理不必要的大型文件 ---")
-
-    patterns = [
-        # CUDA / TensorRT (不需要, 仅用 CPU 推理)
-        "onnxruntime/capi/onnxruntime_providers_cuda*",
-        "onnxruntime/capi/onnxruntime_providers_tensorrt*",
-        "nvinfer*", "nvcuda*", "cudnn*", "cublas*",
-        "cufft*", "curand*", "cusparse*", "cusolver*",
-        # MKL MPI 相关 (不需要)
-        "mkl_blacs_*.dll",
-        "mkl_cdft_*.dll",
-        "mkl_scalapack_*.dll",
-        "mkl_pgi_thread*.dll",
-        "mkl_tbb_thread*.dll",
-        "mkl_msg.dll",
-        # 不需要的 MKL 微架构变体 (保留 mkl_core, mkl_rt, mkl_def, mkl_intel_thread)
-        "mkl_avx.2.dll",
-        "mkl_avx2.2.dll",
-        "mkl_avx512.2.dll",
-        "mkl_mc.2.dll",
-        "mkl_mc3.2.dll",
-        "mkl_vml_avx.2.dll",
-        "mkl_vml_avx2.2.dll",
-        "mkl_vml_avx512.2.dll",
-        "mkl_vml_mc.2.dll",
-        "mkl_vml_mc3.2.dll",
-        # OpenCV ffmpeg (不需要视频)
-        "cv2/opencv_videoio_ffmpeg*",
-        # onnxruntime training 相关
-        "onnxruntime/training/**",
-        # numpy 文档和 f2py
-        "numpy/f2py/**",
-        "numpy/doc/**",
-        # selenium 不需要的浏览器驱动
-        "selenium/webdriver/firefox/**",
-        "selenium/webdriver/edge/**",
-        "selenium/webdriver/safari/**",
-    ]
-
-    freed = 0
-    for pat in patterns:
-        for f in glob.glob(os.path.join(internal, pat)):
-            sz = os.path.getsize(f)
-            for attempt in range(5):
+    # 3. 注入系统权威最新的 Visual C++ 2015-2022 运行时动态库
+    # 彻底杜绝 PyInstaller 抓取旧版 MSVCP140.dll (14.36) 导致的 0xC0000005 访问违规闪退
+    internal_dir = os.path.join(DIST_DIR, "_internal")
+    if os.path.exists(internal_dir):
+        sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+        vc_patterns = ["msvcp140*.dll", "vcruntime140*.dll", "vcomp140*.dll"]
+        copied_vc = 0
+        for pat in vc_patterns:
+            for f in glob.glob(os.path.join(sys32, pat)):
                 try:
-                    if os.path.isfile(f):
-                        os.remove(f)
-                    elif os.path.isdir(f):
-                        shutil.rmtree(f, ignore_errors=True)
-                    freed += sz
-                    break
-                except PermissionError:
-                    time.sleep(1)
-            else:
-                print(f"⚠ 无法删除文件 (已被锁定): {f}")
+                    shutil.copy2(f, internal_dir)
+                    copied_vc += 1
+                except Exception as e:
+                    print(f"⚠ 复制 VC 运行时提示: {e}")
+        if copied_vc > 0:
+            print(f"✅ 已注入系统最新 VC++ 2015-2022 运行时动态库 ({copied_vc} 个 DLL)")
 
-    if freed > 0:
-        print(f"✅ 已清理 {freed / 1024 / 1024:.0f} MB 不必要的文件 (CUDA/MKL/ffmpeg)")
+    # 4. 生成一键控制台调试启动脚本
+    bat_content = """@echo off
+chcp 65001 >nul
+cd /d "%~dp0"
+echo ====================================================
+echo  ARAM 海克斯助手 (控制台排错启动器)
+echo  如遇异常，请保留此控制台窗口并复制报错信息
+echo ====================================================
+echo 正在启动 ARAMHelper.exe ...
+ARAMHelper.exe
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo ❌ 程序发生异常退出，退出码: %ERRORLEVEL%
+    pause
+)
+"""
+    bat_path = os.path.join(DIST_DIR, "启动助手_带调试控制台.bat")
+    try:
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+        print(f"✅ 生成排错批处理: {bat_path}")
+    except Exception as e:
+        print(f"⚠ 写入排错批处理提示: {e}")
 
-    # 清理 numpy 内部的 setup.py (防止"source directory"误检测)
-    numpy_dir = os.path.join(internal, "numpy")
-    if os.path.exists(numpy_dir):
-        count = 0
-        for root, dirs, files in os.walk(numpy_dir):
-            for f in files:
-                if f in ('setup.py', 'setup.cfg'):
-                    full_p = os.path.join(root, f)
-                    for attempt in range(5):
-                        try:
-                            os.remove(full_p)
-                            count += 1
-                            break
-                        except PermissionError:
-                            time.sleep(1)
-            # 也删除 tests 目录减小体积
-            if 'tests' in dirs:
-                full_test_dir = os.path.join(root, 'tests')
-                for attempt in range(5):
-                    try:
-                        shutil.rmtree(full_test_dir, ignore_errors=True)
-                        break
-                    except Exception:
-                        time.sleep(1)
-                dirs.remove('tests')
-        if count > 0:
-            print(f"✅ 已清理 numpy 内部 {count} 个 setup 文件")
+    print("✅ 运行时文件配置完成")
+
+
+def sync_to_latest_dist():
+    """自动同步一份到 dist/最新版_ARAMHelper 目录，方便用户直接运行"""
+    try:
+        latest_dir = os.path.join("dist", "最新版_ARAMHelper")
+        print(f"\n--- 正在同步到直接运行目录: {latest_dir} ---")
+        if os.path.exists(latest_dir):
+            shutil.rmtree(latest_dir, ignore_errors=True)
+        shutil.copytree(DIST_DIR, latest_dir)
+        print(f"✅ 最新免安装版本已就绪: {os.path.abspath(latest_dir)}\\ARAMHelper.exe")
+    except Exception as e:
+        print(f"⚠ 同步到最新版目录提示: {e}")
 
 
 def print_summary():
@@ -274,8 +232,10 @@ def print_summary():
     size_mb = total_size / (1024 * 1024)
     print(f"  总大小: {size_mb:.1f} MB")
 
-    print(f"\n  分发方式: 将 {DIST_DIR}/ 整个文件夹打成 ZIP 发给用户")
-    print(f"  用户使用: 解压后双击 {APP_NAME}.exe 即可运行\n")
+    latest_dir = os.path.join("dist", "最新版_ARAMHelper")
+    print(f"\n  ⭐ 用户直接测试推荐目录: {os.path.abspath(latest_dir)}")
+    print(f"  可双击: {os.path.join(latest_dir, APP_NAME + '.exe')}")
+    print(f"  或者排错双击: {os.path.join(latest_dir, '启动助手_带调试控制台.bat')}\n")
 
 
 def main():
@@ -294,7 +254,7 @@ def main():
         return
 
     copy_runtime_files()
-    cleanup_bloat()
+    sync_to_latest_dist()
     print_summary()
 
 

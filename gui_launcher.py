@@ -11,7 +11,7 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 import queue
 import sys
@@ -36,11 +36,33 @@ def set_low_priority():
         except Exception:
             pass
 
-# ============ 路径初始化 (兼容 PyInstaller 打包) ============
+# ============ 路径与 DLL 初始化 (兼容 PyInstaller 打包) ============
 
 from scripts.config import get_base_dir, BASE_DIR
 os.chdir(BASE_DIR)
 sys.path.insert(0, BASE_DIR)
+
+# 确保 Windows 下 PyInstaller 冻结环境优先检索 C++ 运行时及 ONNX Runtime 原生 DLL
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+    internal_dir = os.path.join(exe_dir, '_internal')
+    if os.path.exists(internal_dir):
+        try:
+            os.add_dll_directory(internal_dir)
+        except Exception:
+            pass
+        capi_dir = os.path.join(internal_dir, 'onnxruntime', 'capi')
+        if os.path.exists(capi_dir):
+            try:
+                os.add_dll_directory(capi_dir)
+            except Exception:
+                pass
+    try:
+        sys32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+        if os.path.exists(sys32):
+            os.add_dll_directory(sys32)
+    except Exception:
+        pass
 
 # ============ 延迟导入 (需要 path 已设置) ============
 
@@ -471,29 +493,29 @@ class UpdateDialog:
         tk.Label(main, text="选择更新方式", font=("Microsoft YaHei", 16, "bold"),
                  fg=self.TEXT, bg=self.BG).pack(anchor="w", pady=(0, 4))
 
-        # ---- 爬虫选项区 ----
-        tk.Label(main, text="🌐 本地爬虫更新 (需要 Chrome 浏览器)",
-                 font=("Microsoft YaHei", 9), fg=self.WARNING,
+        # ---- 权威在线直连更新区 ----
+        tk.Label(main, text="⚡ 权威源极速更新 (OP.GG 直连，免 Chrome，毫秒级)",
+                 font=("Microsoft YaHei", 9, "bold"), fg=self.ACCENT,
                  bg=self.BG).pack(anchor="w", pady=(8, 6))
 
         self._option_row(main,
             icon="🔍", title="抽样校验", tag="推荐",
-            desc="随机3英雄比对，有差异自动全量更新",
+            desc="随机抽取3名英雄校验云端数据，有差异即秒级升级",
             command=lambda: self._select('spot_check'))
 
         self._option_row(main,
             icon="🧠", title="智能增量", tag=None,
-            desc="自动爬取新英雄 + 改名英雄 + 缺失英雄",
+            desc="极速拉取新版本英雄 + 改名英雄 + 缺失英雄",
             command=lambda: self._select('smart'))
 
         self._option_row(main,
-            icon="🔄", title="全量更新", tag=None,
-            desc="强制重爬所有英雄，耗时较长",
+            icon="🔄", title="全量更新", tag="极速",
+            desc="拉取全服 170+ 英雄权威胜率，并发仅需约 30 秒",
             command=lambda: self._select('full'))
 
         self._option_row(main,
             icon="🎯", title="精确更新", tag=None,
-            desc="手动指定英雄名称进行更新",
+            desc="输入英雄名或拼音缩写 (如 ez/女警) 单挑更新",
             command=self._precise_input)
 
         # ---- 分隔线 ----
@@ -501,14 +523,24 @@ class UpdateDialog:
         sep_frame.pack(fill=tk.X)
         tk.Frame(sep_frame, bg=self.BORDER, height=1).pack(fill=tk.X)
 
-        # ---- GitHub 下载 ----
-        tk.Label(main, text="📦 在线下载 (无需浏览器)",
-                 font=("Microsoft YaHei", 9), fg=self.TEXT_DIM,
+        # ---- 手动与离线维护区 ----
+        tk.Label(main, text="📂 手动维护与离线导入",
+                 font=("Microsoft YaHei", 9, "bold"), fg=self.SUCCESS,
                  bg=self.BG).pack(anchor="w", pady=(0, 6))
 
         self._option_row(main,
-            icon="📥", title="GitHub 下载", tag=None,
-            desc="从仓库下载预处理数据 (取决于仓库更新时间)",
+            icon="📁", title="手动导入本地数据", tag=None,
+            desc="选择本地 CSV 数据文件直接导入并立即热生效",
+            command=self._import_file)
+
+        self._option_row(main,
+            icon="💾", title="导出当前数据备份", tag=None,
+            desc="导出当前海克斯胜率数据库，便于离线备份或分享",
+            command=self._export_file)
+
+        self._option_row(main,
+            icon="📥", title="GitHub 仓库拉取", tag=None,
+            desc="从官方开源仓库下载静态库 (兜底通道)",
             command=lambda: self._select('github'))
 
         # ---- 底部: 帮助按钮 ----
@@ -605,6 +637,31 @@ class UpdateDialog:
 
         ttk.Button(frame, text="开始更新", style='Accent.TButton',
                    command=_submit).pack(fill=tk.X)
+
+    def _import_file(self):
+        """手动导入外部 CSV 数据文件"""
+        filepath = filedialog.askopenfilename(
+            parent=self.dlg,
+            title="选择要导入的海克斯数据文件 (CSV)",
+            filetypes=[("CSV 文本文件", "*.csv"), ("所有文件", "*.*")]
+        )
+        if filepath:
+            self.dlg.destroy()
+            self.app._run_import(filepath)
+
+    def _export_file(self):
+        """导出当前数据文件"""
+        import datetime
+        default_name = f"hero_augments_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filepath = filedialog.asksaveasfilename(
+            parent=self.dlg,
+            title="保存当前海克斯数据库备份",
+            initialfile=default_name,
+            filetypes=[("CSV 文本文件", "*.csv")]
+        )
+        if filepath:
+            self.dlg.destroy()
+            self.app._run_export(filepath)
 
     def _show_help(self):
         """显示帮助信息"""
@@ -928,10 +985,12 @@ class LauncherApp:
                     self.gui_queue.put({"event": "data_loaded"})
                 else:
                     self._log("❌ 未加载到英雄数据，请检查 data/ 目录")
-                    self.gui_queue.put({"event": "data_error"})
+                    self.gui_queue.put({"event": "data_error", "msg": "未在 data 目录下找到有效的英雄数据"})
             except Exception as e:
+                import traceback
+                err_detail = traceback.format_exc()
                 self._log(f"❌ 数据加载失败: {e}")
-                self.gui_queue.put({"event": "data_error"})
+                self.gui_queue.put({"event": "data_error", "msg": f"{e}\n\n{err_detail}"})
 
         self._log("正在加载数据资源...")
         threading.Thread(target=_load, daemon=True).start()
@@ -1082,6 +1141,33 @@ class LauncherApp:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _run_import(self, filepath):
+        """执行手动数据导入"""
+        self.update_btn.config(state=tk.DISABLED)
+        self._log(f"开始导入外部数据: {filepath}...")
+        def _run():
+            try:
+                from scripts.updater import import_custom_csv
+                success = import_custom_csv(filepath, log_func=self._log_safe)
+                if success:
+                    self._log("✅ 数据导入成功并已刷新！")
+                    self.gui_queue.put({"event": "reload_data"})
+                else:
+                    self._log("❌ 数据导入失败")
+            except Exception as e:
+                self._log(f"❌ 导入异常: {e}")
+            finally:
+                self.gui_queue.put({"event": "update_done"})
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _run_export(self, filepath):
+        """执行数据导出备份"""
+        try:
+            from scripts.updater import export_current_data
+            export_current_data(filepath, log_func=self._log_safe)
+        except Exception as e:
+            self._log(f"❌ 导出异常: {e}")
+
     # ==========================================
     # 系统托盘
     # ==========================================
@@ -1148,6 +1234,12 @@ class LauncherApp:
 
         elif event == "data_error":
             self.start_btn.config(state=tk.DISABLED)
+            err_msg = msg.get("msg")
+            if err_msg:
+                try:
+                    messagebox.showerror("ARAM海克斯助手 - 数据加载异常", f"数据加载过程中发生错误:\n\n{err_msg}")
+                except Exception:
+                    pass
 
         elif event == "create_overlay":
             self._create_overlay_and_start()

@@ -10,6 +10,7 @@ import time
 import json
 import csv
 import sys
+import re
 try:
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -28,15 +29,48 @@ import keyboard
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from thefuzz import process, fuzz
-from scripts.config import BASE_DIR, DATA_DIR
+from scripts.config import BASE_DIR, DATA_DIR, ALL_AUGMENTS_FILE
 from scripts.lcu_connector import LCUConnector
-from rapidocr_onnxruntime import RapidOCR
 
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
+# 确保 Windows 下 PyInstaller 冻结环境优先检索 C++ 运行时及 ONNX Runtime 原生 DLL
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+    internal_dir = os.path.join(exe_dir, '_internal')
+    if os.path.exists(internal_dir):
+        try:
+            os.add_dll_directory(internal_dir)
+        except Exception:
+            pass
+        capi_dir = os.path.join(internal_dir, 'onnxruntime', 'capi')
+        if os.path.exists(capi_dir):
+            try:
+                os.add_dll_directory(capi_dir)
+            except Exception:
+                pass
+    try:
+        sys32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+        if os.path.exists(sys32):
+            os.add_dll_directory(sys32)
+    except Exception:
+        pass
+
+RapidOCR = None
+cv2 = None
+HAS_CV2 = False
+
+def _ensure_ocr_modules():
+    """按需延迟加载 RapidOCR 与 OpenCV，彻底杜绝数据加载或轻量启动时的 C++ CRT 崩溃"""
+    global RapidOCR, cv2, HAS_CV2
+    if cv2 is None and not HAS_CV2:
+        try:
+            import cv2 as _cv2
+            cv2 = _cv2
+            HAS_CV2 = True
+        except ImportError:
+            HAS_CV2 = False
+    if RapidOCR is None:
+        from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+        RapidOCR = _RapidOCR
 
 
 def set_low_priority():
@@ -54,42 +88,58 @@ def set_low_priority():
 
 # ================= 配置与常量 =================
 
-def get_regions():
-    """根据当前屏幕分辨率动态计算海克斯文字截取区域 (垂直居中完整包裹卡片标题)"""
-    with mss.mss() as sct:
-        mon = sct.monitors[1]  # 主显示器
-        W, H = mon['width'], mon['height']
-    return {
-        "hex_1": {'top': int(H * 0.385), 'left': int(W * 0.2539), 'width': int(W * 0.125), 'height': int(H * 0.052)},
-        "hex_2": {'top': int(H * 0.385), 'left': int(W * 0.4414), 'width': int(W * 0.125), 'height': int(H * 0.052)},
-        "hex_3": {'top': int(H * 0.385), 'left': int(W * 0.625),  'width': int(W * 0.125), 'height': int(H * 0.052)},
-    }
+_CACHED_REGIONS = None
 
+def get_regions():
+    """根据当前屏幕分辨率动态计算海克斯文字截取区域 (垂直居中完整包裹卡片标题，避开底部标签)"""
+    global _CACHED_REGIONS
+    if _CACHED_REGIONS is None:
+        try:
+            with mss.mss() as sct:
+                mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                W, H = mon['width'], mon['height']
+        except Exception:
+            W, H = 1920, 1080  # 默认 1080p 安全回退
+        _CACHED_REGIONS = {
+            "hex_1": {'top': int(H * 0.380), 'left': int(W * 0.250), 'width': int(W * 0.132), 'height': int(H * 0.046)},
+            "hex_2": {'top': int(H * 0.380), 'left': int(W * 0.437), 'width': int(W * 0.132), 'height': int(H * 0.046)},
+            "hex_3": {'top': int(H * 0.380), 'left': int(W * 0.621), 'width': int(W * 0.132), 'height': int(H * 0.046)},
+        }
+    return _CACHED_REGIONS
 
 REGIONS = get_regions()
 
+_CACHED_BANNER_LAYOUT = None
+
 def get_banner_layout():
     """计算紧凑型浮窗几何参数 (仅覆盖三张海克斯卡牌上方区域，面积缩减 96% 以上，从根本上杜绝 DWM 全屏合成掉帧)"""
-    with mss.mss() as sct:
-        mon = sct.monitors[1]
-        W, H = mon['width'], mon['height']
-        off_x, off_y = mon['left'], mon['top']
+    global _CACHED_BANNER_LAYOUT
+    if _CACHED_BANNER_LAYOUT is None:
+        try:
+            with mss.mss() as sct:
+                mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                W, H = mon['width'], mon['height']
+                off_x, off_y = mon['left'], mon['top']
+        except Exception:
+            W, H, off_x, off_y = 1920, 1080, 0, 0
 
-    min_left = max(0, int(REGIONS['hex_1']['left'] - W * 0.015))
-    max_right = min(W, int(REGIONS['hex_3']['left'] + REGIONS['hex_3']['width'] + W * 0.025))
-    banner_w = max_right - min_left
-    banner_h = max(75, int(H * 0.08))  # 约 80~110px 高度，足够显示推荐
-    banner_y = max(0, int(REGIONS['hex_1']['top'] - banner_h - 15))
+        regs = get_regions()
+        min_left = max(0, int(regs['hex_1']['left'] - W * 0.015))
+        max_right = min(W, int(regs['hex_3']['left'] + regs['hex_3']['width'] + W * 0.025))
+        banner_w = max_right - min_left
+        banner_h = max(75, int(H * 0.08))  # 约 80~110px 高度，足够显示推荐
+        banner_y = max(0, int(regs['hex_1']['top'] - banner_h - 15))
 
-    return {
-        "x": off_x + min_left,
-        "y": off_y + banner_y,
-        "width": banner_w,
-        "height": banner_h,
-        "min_left": min_left,
-        "off_x": off_x,
-        "off_y": off_y,
-    }
+        _CACHED_BANNER_LAYOUT = {
+            "x": off_x + min_left,
+            "y": off_y + banner_y,
+            "width": banner_w,
+            "height": banner_h,
+            "min_left": min_left,
+            "off_x": off_x,
+            "off_y": off_y,
+        }
+    return _CACHED_BANNER_LAYOUT
 
 BANNER_LAYOUT = get_banner_layout()
 
@@ -107,6 +157,9 @@ class DataManager:
     """负责加载和管理静态数据"""
     def __init__(self):
         self.hero_data = {}
+        self.all_augments = {}          # 全量海克斯真理库: {std_name: {tier: ...}}
+        self.normalized_aug_map = {}    # 规范化名称 -> 标准名称
+        self.augments_by_len = defaultdict(list) # 长度索引
         # 拼音映射改为 defaultdict(list)，支持一个拼音对应多个英雄
         self.pinyin_map = defaultdict(list)
 
@@ -119,8 +172,16 @@ class DataManager:
 
 
 
-        # 2. 加载英雄数据 (CSV)
+        # 2. 加载英雄数据 (CSV - 带多级路径回退保证)
         csv_path = os.path.join(self.data_dir, 'hero_augments.csv')
+        if not os.path.exists(csv_path):
+            alt = os.path.join(self.base_dir, 'data', 'hero_augments.csv')
+            if os.path.exists(alt):
+                csv_path = alt
+            else:
+                alt2 = os.path.join(os.getcwd(), 'data', 'hero_augments.csv')
+                if os.path.exists(alt2):
+                    csv_path = alt2
         if not os.path.exists(csv_path):
             print(f"❌ 错误: 找不到文件 {csv_path}")
             print(f"   请确认该文件位于: {self.data_dir}")
@@ -208,6 +269,9 @@ class DataManager:
             except Exception as e:
                 print(f"⚠️ {pinyin_file} 加载异常: {e}")
         
+        # 4. 加载全量海克斯真理库 (用于零遗漏纠错与兜底)
+        self._load_all_augments()
+
         print("-> 数据初始化完成")
 
     def search_hero(self, query):
@@ -240,6 +304,108 @@ class DataManager:
             return result[0]
         return None
 
+    def _load_all_augments(self):
+        """加载全量海克斯字典，并构建用于超高召回纠错的索引"""
+        all_aug_path = os.path.join(self.data_dir, 'all_augments.json')
+        if not os.path.exists(all_aug_path):
+            alt = os.path.join(self.base_dir, 'data', 'all_augments.json')
+            if os.path.exists(alt):
+                all_aug_path = alt
+            elif 'ALL_AUGMENTS_FILE' in globals() and os.path.exists(ALL_AUGMENTS_FILE):
+                all_aug_path = ALL_AUGMENTS_FILE
+        if os.path.exists(all_aug_path):
+            try:
+                with open(all_aug_path, 'r', encoding='utf-8') as f:
+                    self.all_augments = json.load(f)
+            except Exception as e:
+                print(f"⚠️ {all_aug_path} 加载异常: {e}")
+        
+        # 若文件不存在或为空，从 hero_augments.csv 自动提取
+        if not self.all_augments and self.hero_data:
+            tier_counters = defaultdict(lambda: defaultdict(int))
+            for hero, augs in self.hero_data.items():
+                for name, info in augs.items():
+                    t = info.get('tier', '未知')
+                    if t and t != '未知':
+                        tier_counters[name][t] += 1
+            for name, tc in tier_counters.items():
+                best_t = max(tc.items(), key=lambda x: x[1])[0] if tc else '未知'
+                self.all_augments[name] = {"tier": best_t}
+
+        # 构建规范化反向索引
+        self.normalized_aug_map.clear()
+        self.augments_by_len.clear()
+        for std_name in self.all_augments:
+            norm = re.sub(r'[\s\.,\/#!$%\^&\*;:{}=\-_`~()（）！!：:，·]+', '', std_name).strip()
+            if norm:
+                self.normalized_aug_map[norm] = std_name
+                self.augments_by_len[len(norm)].append(norm)
+        
+        print(f"✅ 全量海克斯真理库加载完毕: 共 {len(self.all_augments)} 个标准海克斯")
+
+    def match_augment_name(self, raw_text):
+        """
+        全量海克斯多级智能纠错召回引擎：
+        1. 精准规范化直出 (O(1))
+        2. 常见标签剥离匹配
+        3. 短词编辑距离精准纠错
+        4. 自适应长度模糊纠错 (长词高容错，短词高保真)
+        """
+        if not raw_text:
+            return None, 0
+        
+        tag_words = {"伤害", "功能", "防御", "续航", "控制", "通用", "强化", "攻击", "法术", "坦克", "移动", "金币"}
+
+        # 1. 直接精确命中
+        if raw_text in self.all_augments:
+            return raw_text, 100
+        
+        # 2. 规范化字符命中 (去除一切冒号、感叹号、空格)
+        norm_raw = re.sub(r'[\s\.,\/#!$%\^&\*;:{}=\-_`~()（）！!：:，·]+', '', raw_text).strip()
+        if not norm_raw:
+            return None, 0
+            
+        if norm_raw in self.normalized_aug_map:
+            return self.normalized_aug_map[norm_raw], 100
+        
+        # 3. 剥离末尾标签词重试
+        stripped_norm = norm_raw
+        for tag in tag_words:
+            if stripped_norm.endswith(tag) and len(stripped_norm) > len(tag):
+                candidate = stripped_norm[:-len(tag)]
+                if candidate in self.normalized_aug_map:
+                    return self.normalized_aug_map[candidate], 95
+                stripped_norm = candidate
+
+        # 4. 候选集过滤 (优先取长度 ±1 的海克斯)
+        raw_len = len(stripped_norm)
+        candidates = []
+        for delta in [0, -1, 1, -2, 2]:
+            candidates.extend(self.augments_by_len.get(raw_len + delta, []))
+        if not candidates:
+            candidates = list(self.normalized_aug_map.keys())
+
+        # 5. 针对 2 字超短词的编辑距离容错 (只要错1字即召回)
+        if raw_len == 2:
+            two_char_candidates = [c for c in candidates if len(c) == 2]
+            best_c = None
+            best_diff = 999
+            for c in two_char_candidates:
+                diff = sum(1 for a, b in zip(stripped_norm, c) if a != b)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_c = c
+            if best_diff <= 1 and best_c:
+                return self.normalized_aug_map[best_c], 85
+
+        # 6. 动态阈值模糊匹配
+        best_match, score = process.extractOne(stripped_norm, candidates, scorer=fuzz.ratio)
+        min_score = 65 if raw_len >= 3 else 70
+        if score >= min_score:
+            return self.normalized_aug_map[best_match], score
+
+        return None, score
+
 # ================= 2. 图像分析 (Core Logic) =================
 
 class GameAnalyzer:
@@ -248,6 +414,8 @@ class GameAnalyzer:
 
     def __init__(self, data_manager):
         self.dm = data_manager
+        # 延迟初始化 OCR 依赖模块
+        _ensure_ocr_modules()
         # 初始化 OCR 引擎
         try:
             self.ocr = RapidOCR(use_angle_cls=False)
@@ -282,6 +450,7 @@ class GameAnalyzer:
 
     def capture_all_regions(self):
         """批量截图: 复用单个 mss 上下文, 优先使用硬件级 cv2 处理以降低 CPU 开销"""
+        _ensure_ocr_modules()
         images = {}
         try:
             with mss.mss() as sct:
@@ -298,8 +467,11 @@ class GameAnalyzer:
                         # 零拷贝/低开销转换: 直接从 mss 缓冲区转为 numpy 矩阵 (BGRA)
                         arr = np.frombuffer(raw.raw, dtype=np.uint8).reshape((raw.height, raw.width, 4))
                         gray = cv2.cvtColor(arr, cv2.COLOR_BGRA2GRAY)
+                        # CLAHE 对比度自适应直方图均衡化，显著提升弱光发光文字笔画边缘与深色底纹对比
+                        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                        enhanced = clahe.apply(gray)
                         # SIMD 硬件加速双线性插值放大 2 倍
-                        images[key] = cv2.resize(gray, (raw.width * 2, raw.height * 2), interpolation=cv2.INTER_LINEAR)
+                        images[key] = cv2.resize(enhanced, (raw.width * 2, raw.height * 2), interpolation=cv2.INTER_LINEAR)
                     else:
                         img = Image.frombytes("RGB", raw.size, raw.rgb)
                         gray = img.convert("L")
@@ -310,15 +482,52 @@ class GameAnalyzer:
             print(f"批量截图失败: {e}")
         return images
 
+    def _extract_title_from_ocr(self, res_ocr):
+        """
+        智能解析 OCR 识别出来的多行结果：
+        1. 按 y0 纵坐标排序
+        2. 过滤分类标签 (伤害、功能、防御等)
+        3. 剥离标题末尾误粘连的标签词
+        4. 优先选出顶部置信度最高的主标题行
+        """
+        if not res_ocr:
+            return ""
+        
+        tag_words = {"伤害", "功能", "防御", "续航", "控制", "通用", "强化", "攻击", "法术", "坦克", "移动", "金币"}
+        sorted_lines = sorted(res_ocr, key=lambda l: l[0][0][1])
+        title_candidates = []
+        
+        for line in sorted_lines:
+            box, text, score = line
+            text_clean = text.strip().replace(" ", "").replace(".", "")
+            if not text_clean:
+                continue
+            
+            # 检查是否整行纯粹由标签词组成
+            is_pure_tag = all(part in tag_words for part in [text_clean[i:i+2] for i in range(0, len(text_clean), 2)])
+            if is_pure_tag or text_clean in tag_words:
+                continue
+            
+            # 检查是否包含标签后缀（例如"虚幻武器伤害"）并剔除
+            for tag in tag_words:
+                if text_clean.endswith(tag) and len(text_clean) > len(tag):
+                    text_clean = text_clean[:-len(tag)]
+            
+            title_candidates.append(text_clean)
+
+        if not title_candidates:
+            return "".join([l[1] for l in res_ocr]).replace(" ", "").replace(".", "")
+
+        return title_candidates[0]
+
     def _ocr_and_match(self, key, img, hero_cn):
-        """对单张已截取的图片执行 OCR 识别 + 数据匹配"""
+        """对单张已截取的图片执行 OCR 识别 + 全局真理库匹配 + 英雄胜率关联"""
         try:
             if img is None:
                 return {"key": key, "text": "截图错误", "error": True}
 
             res_ocr, _ = self.ocr(img)
-            txt = "".join([line[1] for line in res_ocr]) if res_ocr else ""
-            txt = txt.replace(" ", "").replace(".", "")
+            txt = self._extract_title_from_ocr(res_ocr)
 
             res = {
                 "key": key, "valid": False, "rank": 999, 
@@ -330,46 +539,54 @@ class GameAnalyzer:
                 res["error"] = True
                 return res
 
-            hero_augments = self.dm.hero_data.get(hero_cn, {})
-            if not hero_augments:
-                res["text"] = "无数据"
-                res["error"] = True
+            # 1. 优先查缓存
+            cache_key = (hero_cn or "", txt)
+            if cache_key in self._match_cache:
+                cached = self._match_cache[cache_key]
+                res.update(cached)
                 return res
 
-            match_name = None
-            cache_key = (hero_cn, txt)
-
-            # 1. 命中内存缓存 (O(1))
-            if cache_key in self._match_cache:
-                match_name = self._match_cache[cache_key]
-            # 2. 精确匹配 (O(1))
-            elif txt in hero_augments:
-                match_name = txt
-                self._match_cache[cache_key] = match_name
-            else:
-                # 3. 模糊匹配 (使用精确比例 fuzz.ratio，避免子串过分匹配)
-                match, score = process.extractOne(txt, list(hero_augments.keys()), scorer=fuzz.ratio)
-                if score > 60:
-                    match_name = match
-                self._match_cache[cache_key] = match_name
+            # 2. 全局海克斯真理库召回
+            match_name, score = self.dm.match_augment_name(txt)
 
             if match_name:
-                info = hero_augments[match_name]
-                tier = info.get('tier', '?')
-                t_rank = info.get('t_rank', '?')
-                overall_rank = info.get('overall_rank', '?')
-                # 格式化显示内容: 方案A
-                res["text"] = f"【{match_name}】\n总No.{overall_rank} | {tier} No.{t_rank}"
-                res["valid"] = True
-                res["tier"] = tier
-                res["t_rank"] = info.get('t_rank', 999)
-                res["overall_rank"] = info.get('overall_rank', 999)
+                hero_augments = self.dm.hero_data.get(hero_cn, {}) if hero_cn else {}
+                
+                # 命中英雄专属胜率数据
+                if match_name in hero_augments:
+                    info = hero_augments[match_name]
+                    tier = info.get('tier', '?')
+                    t_rank = info.get('t_rank', 999)
+                    overall_rank = info.get('overall_rank', 999)
+                    res["text"] = "【" + match_name + "】\n总No." + str(overall_rank) + " | " + str(tier) + " No." + str(t_rank)
+                    res["valid"] = True
+                    res["tier"] = tier
+                    res["t_rank"] = t_rank
+                    res["overall_rank"] = overall_rank
+                else:
+                    # 全局收录但该英雄暂未上榜（冷门/新海克斯）：使用全局品质兜底展示，绝不报未识别！
+                    std_info = self.dm.all_augments.get(match_name, {})
+                    tier = std_info.get('tier', '未知')
+                    res["text"] = "【" + match_name + "】\n" + str(tier) + " | 通用/暂无排名"
+                    res["valid"] = True
+                    res["tier"] = tier
+                    res["t_rank"] = 999
+                    res["overall_rank"] = 500  # 通用默认居中推荐
+                
+                # 写入缓存
+                self._match_cache[cache_key] = {
+                    "valid": res["valid"],
+                    "text": res["text"],
+                    "tier": res.get("tier", "未知"),
+                    "t_rank": res.get("t_rank", 999),
+                    "overall_rank": res.get("overall_rank", 999),
+                    "error": False
+                }
             else:
-                res["text"] = "❌ 未识别"
+                res["text"] = f"❌ 未识别: {txt[:6]}"
                 res["error"] = True
             
             return res
-            
         except Exception as e:
             print(f"处理异常 ({key}): {e}")
             return {"key": key, "text": "Error", "error": True}

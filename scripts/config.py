@@ -18,6 +18,7 @@ BASE_DIR = get_base_dir()
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 
 # 数据文件路径常量
-CHAMPION_ID_FILE = os.path.join(DATA_DIR, "champions.json")
-PINYIN_FILE      = os.path.join(DATA_DIR, "pinyin_map.json")
-CSV_FILE         = os.path.join(DATA_DIR, "hero_augments.csv")
+CHAMPION_ID_FILE  = os.path.join(DATA_DIR, "champions.json")
+PINYIN_FILE       = os.path.join(DATA_DIR, "pinyin_map.json")
+CSV_FILE          = os.path.join(DATA_DIR, "hero_augments.csv")
+ALL_AUGMENTS_FILE = os.path.join(DATA_DIR, "all_augments.json")

@@ -12,7 +12,7 @@ from pypinyin import lazy_pinyin
 # 1. 解决同级导入问题 (兼容直接运行和包导入)
 try:
     from scripts import hero_scraper as crawler
-    from scripts.config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from scripts.config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE, ALL_AUGMENTS_FILE
 except ImportError:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
@@ -21,7 +21,7 @@ except ImportError:
     if current_dir not in sys.path:
         sys.path.insert(0, current_dir)
     import hero_scraper as crawler
-    from config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE
+    from config import DATA_DIR, CHAMPION_ID_FILE, PINYIN_FILE, CSV_FILE, ALL_AUGMENTS_FILE
 
 # GitHub 仓库地址 (用于在线下载)
 GITHUB_RAW_BASE  = "https://raw.githubusercontent.com/Nyx0ra/lol-aram-mayhem-hextech-helper/main"
@@ -178,6 +178,7 @@ def merge_and_save(official_en_to_cn, history_data, new_crawl_data):
             writer.writeheader()
             writer.writerows(final_rows)
         print(f"✅ 写入完成！主文件: {CSV_FILE} (共 {len(final_rows)} 条数据)")
+        update_all_augments_file()
     except Exception as e:
         print(f"❌ 写入主文件失败: {e}")
         
@@ -485,3 +486,70 @@ def update_specific_heroes(hero_names, log_func=None):
 
 if __name__ == "__main__":
     main()
+
+# ================= 全局海克斯真理库同步与手动维护 =================
+def update_all_augments_file(log_func=None):
+    """从当前 CSV 重新提取并同步全局海克斯真理库"""
+    _log = log_func or print
+    if not os.path.exists(CSV_FILE):
+        return
+    try:
+        from collections import defaultdict
+        tier_counters = defaultdict(lambda: defaultdict(int))
+        with open(CSV_FILE, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row.get('海克斯名称', '').strip()
+                t = row.get('等级', '').strip()
+                if name and t and t != '未知':
+                    tier_counters[name][t] += 1
+        all_augments = {}
+        for name, tc in tier_counters.items():
+            best_t = max(tc.items(), key=lambda x: x[1])[0] if tc else '未知'
+            all_augments[name] = {"tier": best_t}
+        all_aug_path = ALL_AUGMENTS_FILE if 'ALL_AUGMENTS_FILE' in globals() else os.path.join(DATA_DIR, 'all_augments.json')
+        with open(all_aug_path, 'w', encoding='utf-8') as f:
+            json.dump(all_augments, f, ensure_ascii=False, indent=2)
+        _log(f"✅ 全局海克斯真理库已同步: 共 {len(all_augments)} 个标准海克斯")
+    except Exception as e:
+        _log(f"⚠️ 同步全量海克斯字典异常: {e}")
+
+def import_custom_csv(filepath, log_func=None):
+    """手动导入外部 CSV 数据文件"""
+    _log = log_func or print
+    if not os.path.exists(filepath):
+        _log(f"❌ 找不到文件: {filepath}")
+        return False
+    try:
+        import shutil
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "海克斯名称" not in reader.fieldnames:
+                _log("❌ CSV 文件格式不匹配，必须包含 '海克斯名称' 列")
+                return False
+            rows = list(reader)
+        if not rows:
+            _log("❌ CSV 文件没有有效数据")
+            return False
+        shutil.copyfile(filepath, CSV_FILE)
+        _log(f"✅ 成功导入 {len(rows)} 条海克斯数据到系统！")
+        update_all_augments_file(log_func=_log)
+        return True
+    except Exception as e:
+        _log(f"❌ 导入失败: {e}")
+        return False
+
+def export_current_data(dest_path, log_func=None):
+    """导出当前胜率数据库"""
+    _log = log_func or print
+    if not os.path.exists(CSV_FILE):
+        _log("❌ 本地数据库为空，无法导出")
+        return False
+    try:
+        import shutil
+        shutil.copyfile(CSV_FILE, dest_path)
+        _log(f"✅ 数据库已导出到: {dest_path}")
+        return True
+    except Exception as e:
+        _log(f"❌ 导出失败: {e}")
+        return False
