@@ -86,6 +86,22 @@ def set_low_priority():
         except Exception:
             pass
 
+
+def set_dpi_aware():
+    """启用 DPI 物理像素感知，确保截图坐标在任何屏幕缩放 (125%/150%) 下 100% 物理像素对齐"""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+set_dpi_aware()
+
 # ================= 配置与常量 =================
 
 _CACHED_REGIONS = None
